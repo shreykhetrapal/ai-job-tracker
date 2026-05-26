@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sign in · Company Jobs</title>
+    <link rel="stylesheet" href="./styles.css?v=multi-user" />
+  </head>
+  <body class="login-page">
+    <main class="login-shell">
+      <section class="login-card">
+        <p class="eyebrow">Company Jobs</p>
+        <h1>Sign in</h1>
+        <form id="loginForm">
+          <label>
+            <span>Email</span>
+            <input name="email" type="email" autocomplete="username" required />
+          </label>
+          <label>
+            <span>Password</span>
+            <input name="password" type="password" autocomplete="current-password" required />
+          </label>
+          <button class="primary-button" type="submit">Sign in</button>
+          <p id="loginMessage" class="login-message"></p>
+        </form>
+      </section>
+    </main>
+    <script type="module" src="./login.js?v=multi-user"></script>
+  </body>
+</html>

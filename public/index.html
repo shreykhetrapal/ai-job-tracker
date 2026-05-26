@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Job Application Dashboard</title>
+    <link rel="stylesheet" href="./styles.css?v=company-tabs" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar">
+        <div>
+          <p class="eyebrow">Daily company scanner</p>
+          <h1>Company Jobs</h1>
+        </div>
+        <nav aria-label="Dashboard sections">
+          <a class="nav-button active" data-view="overview" href="#overview">Overview</a>
+          <a class="nav-button" data-view="companies" href="#companies">Companies</a>
+          <a class="nav-button" data-view="scanner" href="#scanner">Scanner</a>
+          <a class="nav-button" data-view="jobs" href="#jobs">Job Board</a>
+          <a class="nav-button" data-view="profile" href="#profile">Profile</a>
+          <a class="nav-button" data-view="email" href="#email">Email Digest</a>
+          <a class="nav-button" data-view="feedback" href="#feedback">Feedback</a>
+          <a class="nav-button" data-view="pipeline" href="#pipeline">Pipeline</a>
+        </nav>
+        <div class="user-panel">
+          <p id="currentUserEmail">Signed in</p>
+          <button id="logoutButton" type="button">Log out</button>
+        </div>
+        <div class="scrape-panel">
+          <p id="lastScrape">No scan yet</p>
+          <button id="scanNow" class="primary-button">Scan all companies</button>
+          <div class="llm-panel">
+            <p id="llmStatus">LLM status not checked</p>
+            <button id="checkLlm" type="button">Check LLM</button>
+          </div>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Your saved companies, scanned daily</p>
+            <h2 id="viewTitle">Overview</h2>
+          </div>
+        </header>
+
+        <section id="overviewView" class="view active">
+          <section class="overview-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">How it works</p>
+                <h3>From target companies to applications</h3>
+              </div>
+            </div>
+            <div class="overview-steps">
+              <article class="overview-card">
+                <span>1</span>
+                <h3>Add companies</h3>
+                <p>Select approved companies. If one is missing, request it for admin review.</p>
+                <a class="ghost-button" href="#companies" data-view="companies">Go to Companies</a>
+              </article>
+              <article class="overview-card">
+                <span>2</span>
+                <h3>Add your profile</h3>
+                <p>Upload your resume or manually add profile keywords, target titles, skills, and locations.</p>
+                <a class="ghost-button" href="#profile" data-view="profile">Go to Profile</a>
+              </article>
+              <article class="overview-card">
+                <span>3</span>
+                <h3>Scan and sort</h3>
+                <p>Scan your companies, review the latest roles, and sort job titles by relevance or date.</p>
+                <a class="ghost-button" href="#scanner" data-view="scanner">Run Scanner</a>
+              </article>
+              <article class="overview-card">
+                <span>4</span>
+                <h3>Apply</h3>
+                <p>Shortlist the strongest matches, use resume tweaks for each job, and track your applications.</p>
+                <a class="ghost-button" href="#jobs" data-view="jobs">Review Jobs</a>
+              </article>
+            </div>
+          </section>
+        </section>
+
+        <section id="companiesView" class="view">
+          <div class="metrics-grid">
+            <article>
+              <span id="watchCompanyMetric">0</span>
+              <p>companies</p>
+            </article>
+            <article>
+              <span id="companyJobMetric">0</span>
+              <p>jobs found</p>
+            </article>
+            <article>
+              <span id="shortlistMetric">0</span>
+              <p>shortlisted</p>
+            </article>
+            <article>
+              <span id="appliedMetric">0</span>
+              <p>applied</p>
+            </article>
+          </div>
+          <div class="company-watch-layout">
+            <div class="company-tabs" role="tablist" aria-label="Company tools">
+              <button class="company-tab-button active" type="button" role="tab" aria-selected="true" data-company-tab="watchlist">My Watchlist</button>
+              <button class="company-tab-button" type="button" role="tab" aria-selected="false" data-company-tab="requests">Requests</button>
+              <button class="company-tab-button" type="button" role="tab" aria-selected="false" data-company-tab="parser" data-admin-only="true">Parser Health</button>
+            </div>
+            <div class="company-tab-panel active" role="tabpanel" data-company-panel="watchlist">
+              <section class="company-presets">
+                <div class="section-heading">
+                  <div>
+                    <p class="eyebrow">Available scanners</p>
+                    <h3>Select approved companies</h3>
+                    <p class="scan-inline-note">Choose companies that already have a supported parser. Missing companies should be requested for admin review.</p>
+                  </div>
+                </div>
+                <div class="preset-company-picker">
+                  <label>
+                    <span>Available companies</span>
+                    <select id="presetCompanySelect" multiple size="5"></select>
+                  </label>
+                </div>
+                <div class="preset-actions">
+                  <button id="selectAllPresetCompanies" type="button">Select all</button>
+                  <button id="addPresetCompanies" class="primary-button" type="button">Add selected</button>
+                </div>
+              </section>
+              <section class="company-watchlist">
+                <div class="section-heading">
+                  <div>
+                    <p class="eyebrow">Daily cadence</p>
+                    <h3>Company watchlist</h3>
+                  </div>
+                  <span id="watchCompanyCount">0</span>
+                </div>
+                <div id="watchCompanyList" class="watch-company-list"></div>
+              </section>
+            </div>
+            <div class="company-tab-panel" role="tabpanel" data-company-panel="requests" hidden>
+              <form id="companyRequestForm" class="company-form">
+                <label>
+                  <span>Company</span>
+                  <input name="name" placeholder="OpenAI" />
+                </label>
+                <label>
+                  <span>Careers URL</span>
+                  <input name="careersUrl" placeholder="https://example.com/careers" />
+                </label>
+                <label class="wide">
+                  <span>Notes</span>
+                  <textarea name="notes" rows="4" placeholder="Team, role family, location, referral notes..."></textarea>
+                </label>
+                <div class="form-actions wide">
+                  <button id="clearCompanyRequestForm" type="button">Clear</button>
+                  <button class="primary-button" type="submit">Request addition</button>
+                </div>
+              </form>
+              <section class="company-requests">
+                <div class="section-heading">
+                  <div>
+                    <p class="eyebrow">Admin reviewed</p>
+                    <h3>Company requests</h3>
+                    <p class="scan-inline-note">Admins can test requests and publish approved companies to the available list.</p>
+                  </div>
+                  <span id="companyRequestCount">0</span>
+                </div>
+                <div id="companyRequestList" class="company-request-list"></div>
+              </section>
+            </div>
+            <section id="adminCompanyHealth" class="company-tab-panel company-requests" role="tabpanel" data-company-panel="parser" data-admin-only="true" hidden>
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Admin parser checks</p>
+                  <h3>Parser health</h3>
+                  <p class="scan-inline-note">Test approved companies to confirm their parser still fetches current job listings.</p>
+                </div>
+                <span id="companyHealthCount">0</span>
+              </div>
+              <div id="companyHealthList" class="company-request-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="scannerView" class="view">
+          <div class="metrics-grid">
+            <article>
+              <span id="scannerRunMetric">0</span>
+              <p>scan runs</p>
+            </article>
+            <article>
+              <span id="scannerJobMetric">0</span>
+              <p>jobs in latest run</p>
+            </article>
+            <article>
+              <span id="scannerLlmMetric">0</span>
+              <p>LLM calls</p>
+            </article>
+            <article>
+              <span id="scannerIssueMetric">0</span>
+              <p>issues</p>
+            </article>
+          </div>
+          <section class="scanner-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Scan debugger</p>
+                <h3>Scanner activity</h3>
+                <p class="scan-inline-note">Use this when a company scans but jobs do not appear.</p>
+              </div>
+              <button id="scannerScanNow" class="primary-button" type="button">Scan all companies</button>
+            </div>
+            <div id="scannerCurrent" class="scanner-current"></div>
+            <div id="scannerRunList" class="scanner-run-list"></div>
+          </section>
+        </section>
+
+        <section id="jobsView" class="view">
+          <div class="metrics-grid">
+            <article>
+              <span id="jobsViewCompanyMetric">0</span>
+              <p>companies</p>
+            </article>
+            <article>
+              <span id="jobsViewJobMetric">0</span>
+              <p>jobs found</p>
+            </article>
+            <article>
+              <span id="jobsViewShortlistMetric">0</span>
+              <p>shortlisted</p>
+            </article>
+            <article>
+              <span id="jobsViewAppliedMetric">0</span>
+              <p>applied</p>
+            </article>
+          </div>
+          <section class="company-results">
+            <div class="section-heading result-heading">
+              <div>
+                <p class="eyebrow">Company site matches</p>
+                <h3>Job Board</h3>
+                <p id="jobListLastScanned" class="scan-inline-note">Not scanned yet</p>
+              </div>
+              <span id="companyJobCount">0</span>
+            </div>
+            <div id="companyJobTable" class="company-job-table"></div>
+          </section>
+        </section>
+
+        <section id="profileView" class="view">
+          <form id="profileForm" class="editor-grid">
+            <label>
+              <span>Name</span>
+              <input name="name" autocomplete="name" />
+            </label>
+            <label>
+              <span>Seniority</span>
+              <input name="seniority" placeholder="Senior, Staff, Lead..." />
+            </label>
+            <label>
+              <span>Target job titles</span>
+              <textarea name="desiredTitles" rows="5"></textarea>
+            </label>
+            <label>
+              <span>Skills and keywords</span>
+              <textarea name="skills" rows="5"></textarea>
+            </label>
+            <label>
+              <span>Locations</span>
+              <textarea name="locations" rows="4"></textarea>
+            </label>
+            <label>
+              <span>Words to avoid</span>
+              <textarea name="avoidKeywords" rows="4"></textarea>
+            </label>
+            <label class="wide">
+              <span>Profile notes</span>
+              <textarea name="notes" rows="5" placeholder="Industries, visa needs, salary floor, companies you like, work style..."></textarea>
+            </label>
+            <div class="form-actions wide">
+              <button class="primary-button" type="submit">Save profile</button>
+            </div>
+          </form>
+          <div class="resume-layout">
+            <form id="resumeForm">
+              <section class="resume-upload-panel">
+                <div>
+                  <p class="eyebrow">Resume file</p>
+                  <h3>Upload resume</h3>
+                  <p>DOCX, DOC, RTF, HTML, TXT, and MD files are converted into editable text below.</p>
+                </div>
+                <label class="resume-file-picker">
+                  <span>Choose file</span>
+                  <input id="resumeUpload" type="file" accept=".doc,.docx,.rtf,.html,.htm,.txt,.md,.text,.odt,.pdf" />
+                </label>
+                <p id="resumeUploadStatus" class="resume-upload-status">No file uploaded yet.</p>
+              </section>
+              <label>
+                <span>Resume text</span>
+                <textarea id="resumeText" rows="18" placeholder="Paste your resume text here. You stay in control of the final edits."></textarea>
+              </label>
+              <button class="primary-button" type="submit">Save resume text</button>
+            </form>
+            <aside class="recommendations">
+              <h3>Recommended edits</h3>
+              <div id="recommendationList"></div>
+            </aside>
+          </div>
+          <section id="adminPanel" class="admin-panel" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Admin</p>
+                <h3>Friend accounts</h3>
+                <p class="scan-inline-note">Create accounts for friends. They only see their own profile, resume, companies, scans, and pipeline.</p>
+              </div>
+            </div>
+            <form id="userForm" class="user-form">
+              <label>
+                <span>Email</span>
+                <input name="email" type="email" placeholder="friend@example.com" />
+              </label>
+              <label>
+                <span>Temporary password</span>
+                <input name="password" type="text" minlength="10" placeholder="At least 10 characters" />
+              </label>
+              <label class="checkbox-label">
+                <input name="isAdmin" type="checkbox" />
+                <span>Admin</span>
+              </label>
+              <button class="primary-button" type="submit">Create user</button>
+            </form>
+            <div id="userList" class="user-list"></div>
+          </section>
+        </section>
+
+        <section id="pipelineView" class="view">
+          <div class="pipeline" id="pipeline"></div>
+        </section>
+
+        <section id="emailView" class="view">
+          <section class="email-digest-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Daily email</p>
+                <h3>Email Digest</h3>
+                <p class="scan-inline-note">Send one morning email with new relevant jobs from your saved companies.</p>
+              </div>
+              <span id="emailDigestConfigured">Not configured</span>
+            </div>
+            <form id="emailDigestForm" class="email-digest-form">
+              <label class="checkbox-label wide">
+                <input name="enabled" type="checkbox" />
+                <span>Send daily job digest</span>
+              </label>
+              <label>
+                <span>Email address</span>
+                <input name="email" type="email" placeholder="you@example.com" />
+              </label>
+              <label>
+                <span>Send time</span>
+                <input name="sendTime" type="time" />
+              </label>
+              <label>
+                <span>Time zone</span>
+                <select name="timeZone" id="emailTimeZone"></select>
+              </label>
+              <label>
+                <span>Minimum relevance score</span>
+                <input name="minRelevanceScore" type="number" min="0" max="10" step="1" />
+              </label>
+              <label>
+                <span>Max jobs per email</span>
+                <input name="maxJobs" type="number" min="1" max="50" step="1" />
+              </label>
+              <div class="form-actions wide">
+                <button id="sendTestEmail" type="button">Send test email</button>
+                <button class="primary-button" type="submit">Save email settings</button>
+              </div>
+            </form>
+            <div class="email-digest-status">
+              <p id="emailDigestStatus">Not sent yet.</p>
+              <p id="emailDigestMeta"></p>
+            </div>
+          </section>
+        </section>
+
+        <section id="feedbackView" class="view">
+          <section class="feedback-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Product feedback</p>
+                <h3>Feedback</h3>
+                <p class="scan-inline-note">Share what is confusing, wrong, or useful. Admins can see feedback from all users.</p>
+              </div>
+              <span id="feedbackCount">0</span>
+            </div>
+            <form id="feedbackForm" class="feedback-form">
+              <label>
+                <span>Your feedback</span>
+                <textarea id="feedbackText" name="message" rows="4" placeholder="Tell us what happened, what you expected, or what would make this better."></textarea>
+              </label>
+              <div class="form-actions">
+                <button class="primary-button" type="submit">Submit feedback</button>
+              </div>
+            </form>
+            <div id="feedbackList" class="feedback-list"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js?v=company-tabs"></script>
+  </body>
+</html>
