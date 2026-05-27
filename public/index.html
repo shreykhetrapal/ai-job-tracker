@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Job Application Dashboard</title>
-    <link rel="stylesheet" href="./styles.css?v=company-tabs" />
+    <link rel="stylesheet" href="./styles.css?v=simple-scanner-2" />
   </head>
   <body>
     <main class="app-shell">
@@ -16,12 +16,12 @@
         <nav aria-label="Dashboard sections">
           <a class="nav-button active" data-view="overview" href="#overview">Overview</a>
           <a class="nav-button" data-view="companies" href="#companies">Companies</a>
-          <a class="nav-button" data-view="scanner" href="#scanner">Scanner</a>
           <a class="nav-button" data-view="jobs" href="#jobs">Job Board</a>
+          <a class="nav-button" data-view="pipeline" href="#pipeline">Pipeline</a>
           <a class="nav-button" data-view="profile" href="#profile">Profile</a>
           <a class="nav-button" data-view="email" href="#email">Email Digest</a>
+          <a class="nav-button" data-view="scanner" href="#scanner">Scanner</a>
           <a class="nav-button" data-view="feedback" href="#feedback">Feedback</a>
-          <a class="nav-button" data-view="pipeline" href="#pipeline">Pipeline</a>
         </nav>
         <div class="user-panel">
           <p id="currentUserEmail">Signed in</p>
@@ -103,40 +103,10 @@
           </div>
           <div class="company-watch-layout">
             <div class="company-tabs" role="tablist" aria-label="Company tools">
-              <button class="company-tab-button active" type="button" role="tab" aria-selected="true" data-company-tab="watchlist">My Watchlist</button>
-              <button class="company-tab-button" type="button" role="tab" aria-selected="false" data-company-tab="requests">Requests</button>
+              <button class="company-tab-button" type="button" role="tab" aria-selected="false" data-company-tab="requests">Request Companies</button>
+              <button class="company-tab-button" type="button" role="tab" aria-selected="false" data-company-tab="approved">Approved Companies</button>
+              <button class="company-tab-button active" type="button" role="tab" aria-selected="true" data-company-tab="watchlist">Company Watchlist</button>
               <button class="company-tab-button" type="button" role="tab" aria-selected="false" data-company-tab="parser" data-admin-only="true">Parser Health</button>
-            </div>
-            <div class="company-tab-panel active" role="tabpanel" data-company-panel="watchlist">
-              <section class="company-presets">
-                <div class="section-heading">
-                  <div>
-                    <p class="eyebrow">Available scanners</p>
-                    <h3>Select approved companies</h3>
-                    <p class="scan-inline-note">Choose companies that already have a supported parser. Missing companies should be requested for admin review.</p>
-                  </div>
-                </div>
-                <div class="preset-company-picker">
-                  <label>
-                    <span>Available companies</span>
-                    <select id="presetCompanySelect" multiple size="5"></select>
-                  </label>
-                </div>
-                <div class="preset-actions">
-                  <button id="selectAllPresetCompanies" type="button">Select all</button>
-                  <button id="addPresetCompanies" class="primary-button" type="button">Add selected</button>
-                </div>
-              </section>
-              <section class="company-watchlist">
-                <div class="section-heading">
-                  <div>
-                    <p class="eyebrow">Daily cadence</p>
-                    <h3>Company watchlist</h3>
-                  </div>
-                  <span id="watchCompanyCount">0</span>
-                </div>
-                <div id="watchCompanyList" class="watch-company-list"></div>
-              </section>
             </div>
             <div class="company-tab-panel" role="tabpanel" data-company-panel="requests" hidden>
               <form id="companyRequestForm" class="company-form">
@@ -160,13 +130,46 @@
               <section class="company-requests">
                 <div class="section-heading">
                   <div>
-                    <p class="eyebrow">Admin reviewed</p>
+                    <p class="eyebrow">Requested scanners</p>
                     <h3>Company requests</h3>
-                    <p class="scan-inline-note">Admins can test requests and publish approved companies to the available list.</p>
+                    <p class="scan-inline-note">Track companies you requested. Approved companies become available for everyone.</p>
                   </div>
                   <span id="companyRequestCount">0</span>
                 </div>
                 <div id="companyRequestList" class="company-request-list"></div>
+              </section>
+            </div>
+            <div class="company-tab-panel" role="tabpanel" data-company-panel="approved" hidden>
+              <section class="company-presets">
+                <div class="section-heading">
+                  <div>
+                    <p class="eyebrow">Available scanners</p>
+                    <h3>Select approved companies</h3>
+                    <p class="scan-inline-note">Choose companies that already have a supported parser. Missing companies should be requested for admin review.</p>
+                  </div>
+                </div>
+                <div class="preset-company-picker">
+                  <label>
+                    <span>Available companies</span>
+                    <select id="presetCompanySelect" multiple size="5"></select>
+                  </label>
+                </div>
+                <div class="preset-actions">
+                  <button id="selectAllPresetCompanies" type="button">Select all</button>
+                  <button id="addPresetCompanies" class="primary-button" type="button">Add selected</button>
+                </div>
+              </section>
+            </div>
+            <div class="company-tab-panel active" role="tabpanel" data-company-panel="watchlist">
+              <section class="company-watchlist">
+                <div class="section-heading">
+                  <div>
+                    <p class="eyebrow">Daily cadence</p>
+                    <h3>Company watchlist</h3>
+                  </div>
+                  <span id="watchCompanyCount">0</span>
+                </div>
+                <div id="watchCompanyList" class="watch-company-list"></div>
               </section>
             </div>
             <section id="adminCompanyHealth" class="company-tab-panel company-requests" role="tabpanel" data-company-panel="parser" data-admin-only="true" hidden>
@@ -187,27 +190,27 @@
           <div class="metrics-grid">
             <article>
               <span id="scannerRunMetric">0</span>
-              <p>scan runs</p>
+              <p id="scannerRunMetricLabel">scan runs</p>
             </article>
             <article>
               <span id="scannerJobMetric">0</span>
-              <p>jobs in latest run</p>
+              <p id="scannerJobMetricLabel">jobs in latest run</p>
             </article>
             <article>
               <span id="scannerLlmMetric">0</span>
-              <p>LLM calls</p>
+              <p id="scannerLlmMetricLabel">LLM calls</p>
             </article>
             <article>
               <span id="scannerIssueMetric">0</span>
-              <p>issues</p>
+              <p id="scannerIssueMetricLabel">issues</p>
             </article>
           </div>
           <section class="scanner-panel">
             <div class="section-heading">
               <div>
-                <p class="eyebrow">Scan debugger</p>
-                <h3>Scanner activity</h3>
-                <p class="scan-inline-note">Use this when a company scans but jobs do not appear.</p>
+                <p id="scannerPanelEyebrow" class="eyebrow">Scan debugger</p>
+                <h3 id="scannerPanelTitle">Scanner activity</h3>
+                <p id="scannerPanelNote" class="scan-inline-note">Use this when a company scans but jobs do not appear.</p>
               </div>
               <button id="scannerScanNow" class="primary-button" type="button">Scan all companies</button>
             </div>
@@ -410,6 +413,6 @@
       </section>
     </main>
 
-    <script type="module" src="./app.js?v=company-tabs"></script>
+    <script type="module" src="./app.js?v=companies-clean-1"></script>
   </body>
 </html>

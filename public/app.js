@@ -60,6 +60,13 @@ const els = {
   scannerJobMetric: document.querySelector("#scannerJobMetric"),
   scannerLlmMetric: document.querySelector("#scannerLlmMetric"),
   scannerIssueMetric: document.querySelector("#scannerIssueMetric"),
+  scannerRunMetricLabel: document.querySelector("#scannerRunMetricLabel"),
+  scannerJobMetricLabel: document.querySelector("#scannerJobMetricLabel"),
+  scannerLlmMetricLabel: document.querySelector("#scannerLlmMetricLabel"),
+  scannerIssueMetricLabel: document.querySelector("#scannerIssueMetricLabel"),
+  scannerPanelEyebrow: document.querySelector("#scannerPanelEyebrow"),
+  scannerPanelTitle: document.querySelector("#scannerPanelTitle"),
+  scannerPanelNote: document.querySelector("#scannerPanelNote"),
   scannerCurrent: document.querySelector("#scannerCurrent"),
   scannerRunList: document.querySelector("#scannerRunList"),
   scannerScanNow: document.querySelector("#scannerScanNow"),
@@ -105,12 +112,12 @@ const els = {
 const viewTitles = {
   overview: "Overview",
   companies: "Company Watchlist",
-  scanner: "Scanner Activity",
   jobs: "Job Board",
+  pipeline: "Application Pipeline",
   profile: "Your Profile",
   email: "Email Digest",
+  scanner: "Scanner",
   feedback: "Feedback",
-  pipeline: "Application Pipeline"
 };
 
 const commonTimeZones = [
@@ -299,6 +306,54 @@ function scanProgressValues(run) {
   };
 }
 
+function scannerMatchedCount(run) {
+  const totals = run?.totals || {};
+  const explicit = Number(totals.matchedJobs);
+  if (Number.isFinite(explicit)) return explicit;
+  return Number(totals.llmSucceeded || 0) + Number(totals.llmFailed || 0) + Number(totals.llmCacheHits || 0);
+}
+
+function userRunIssueCount(run) {
+  const totals = run.totals || {};
+  const companyIssues = (run.companies || []).reduce((count, company) => {
+    const issueCount = Number(company.issueCount ?? company.errors?.length ?? 0);
+    return count + (Number.isFinite(issueCount) ? issueCount : 0);
+  }, 0);
+  return Math.max(Number(totals.errors || 0), companyIssues);
+}
+
+function userScanProgressValues(run) {
+  const totals = run.totals || {};
+  const companyCount = Math.max(1, totals.companies || (run.companies || []).length || 1);
+  const completedCompanies = completedCompanyCount(run);
+  const active = run.status === "running";
+  const rawJobs = Number(totals.rawJobsFound || 0);
+  const savedJobs = Number(totals.jobsFound || 0);
+  const matchingDone = scannerMatchedCount(run);
+  const remainingCompanies = Math.max(0, companyCount - completedCompanies);
+  const jobTarget = active
+    ? Math.max(rawJobs + remainingCompanies * 10, rawJobs, savedJobs, 1)
+    : Math.max(rawJobs, savedJobs, 1);
+  const matchingTarget = Math.max(rawJobs, savedJobs, matchingDone, 1);
+  return {
+    jobsPercent: active ? Math.min(100, Math.round((rawJobs / jobTarget) * 100)) : (rawJobs || savedJobs ? 100 : 0),
+    matchingPercent: active ? Math.min(100, Math.round((matchingDone / matchingTarget) * 100)) : (matchingTarget > 1 ? 100 : 0),
+    rawJobs,
+    savedJobs,
+    matchingDone,
+    matchingTarget,
+    completedCompanies,
+    companyCount
+  };
+}
+
+function scannerIssueCompanies(run) {
+  return (run.companies || []).filter((company) => {
+    const issueCount = Number(company.issueCount ?? company.errors?.length ?? 0);
+    return company.status === "failed" || issueCount > 0;
+  });
+}
+
 function scannerLogLine(call) {
   const timestamp = call.at ? new Date(call.at) : null;
   const time = timestamp && !Number.isNaN(timestamp.getTime())
@@ -326,6 +381,24 @@ function scrollScannerLogsToLatest() {
 
 function statusFor(job) {
   return state.statuses[job.id]?.status || "new";
+}
+
+function statusRecordFor(jobOrId) {
+  const id = typeof jobOrId === "string" ? jobOrId : jobOrId?.id;
+  return id ? state.statuses?.[id] || {} : {};
+}
+
+function trackingStatusLabel(status) {
+  const labels = {
+    shortlisted: "Shortlisted",
+    applied: "Applied",
+    rejected: "Not Interested"
+  };
+  return labels[status] || "";
+}
+
+function isJobViewed(job) {
+  return Boolean(statusRecordFor(job).viewedAt || statusFor(job) !== "new");
 }
 
 function relevanceFor(job) {
@@ -408,12 +481,38 @@ function sortArrow(sortKey) {
 
 function jobTitleMetaLabel(job) {
   const relevance = relevanceFor(job);
+  const status = statusFor(job);
+  const trackingLabel = trackingStatusLabel(status);
   const parts = [];
+  if (trackingLabel) parts.push(trackingLabel);
+  else if (isJobViewed(job)) parts.push("Viewed");
   if (relevance === "relevant") parts.push("Relevant");
   if (relevance === "not_relevant") parts.push("Not relevant");
   parts.push(`${relevanceScoreLabel(job)} relevance`);
   parts.push(`Posted ${dateLabel(job.postedAt)}`);
   return parts.join(" · ");
+}
+
+function jobTitleRowClass(job, selectedJob) {
+  const classes = ["title-row"];
+  const status = statusFor(job);
+  if (job.id === selectedJob?.id) classes.push("active");
+  if (isJobViewed(job)) classes.push("viewed");
+  if (["shortlisted", "applied", "rejected"].includes(status)) classes.push(status);
+  return classes.join(" ");
+}
+
+function markJobViewedLocally(id) {
+  const existing = state.statuses?.[id] || {};
+  if (existing.viewedAt) return false;
+  state.statuses = {
+    ...(state.statuses || {}),
+    [id]: {
+      ...existing,
+      viewedAt: new Date().toISOString()
+    }
+  };
+  return true;
 }
 
 function captureJobPaneScroll() {
@@ -659,23 +758,32 @@ function renderPresetCompanies() {
 
 function renderCompanyTabs() {
   const isAdmin = Boolean(state.currentUser?.isAdmin);
-  if (!isAdmin && state.companiesTab === "parser") {
+  const visibleTabs = new Set(
+    Array.from(els.companyTabButtons)
+      .filter((button) => isAdmin || button.dataset.adminOnly !== "true")
+      .map((button) => button.dataset.companyTab)
+  );
+  if (!visibleTabs.has(state.companiesTab)) {
     state.companiesTab = "watchlist";
   }
 
   els.companyTabButtons.forEach((button) => {
     const adminOnly = button.dataset.adminOnly === "true";
+    const visible = isAdmin || !adminOnly;
     const active = button.dataset.companyTab === state.companiesTab;
-    button.hidden = adminOnly && !isAdmin;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", String(active));
+    button.hidden = !visible;
+    button.setAttribute("aria-hidden", String(!visible));
+    button.classList.toggle("active", visible && active);
+    button.setAttribute("aria-selected", String(visible && active));
   });
 
   els.companyTabPanels.forEach((panel) => {
     const adminOnly = panel.dataset.adminOnly === "true";
+    const visible = isAdmin || !adminOnly;
     const active = panel.dataset.companyPanel === state.companiesTab;
-    panel.hidden = (adminOnly && !isAdmin) || !active;
-    panel.classList.toggle("active", active);
+    panel.hidden = !visible || !active;
+    panel.setAttribute("aria-hidden", String(!visible || !active));
+    panel.classList.toggle("active", visible && active);
   });
 }
 
@@ -688,6 +796,14 @@ function requestStatusLabel(request) {
     rejected: "Rejected"
   };
   return labels[request.status] || request.status || "Pending";
+}
+
+function requestStatusNote(request) {
+  if (request.status === "approved") return "Available under Approved Companies.";
+  if (request.status === "rejected") return request.adminNotes || "Not approved yet.";
+  if (request.status === "tested") return "Tested by admin and waiting for approval.";
+  if (request.status === "test_failed") return "Admin test found an issue; parser work is needed.";
+  return "Waiting for admin review.";
 }
 
 function parserTestLabel(summary) {
@@ -808,6 +924,47 @@ function renderCompanyRequests() {
     empty.className = "empty-state";
     empty.textContent = "No company requests yet.";
     els.companyRequestList.append(empty);
+    return;
+  }
+
+  if (!state.currentUser?.isAdmin) {
+    const table = document.createElement("table");
+    table.className = "company-request-table user-request-table";
+    table.innerHTML = `
+      <thead>
+        <tr>
+          <th>Company</th>
+          <th>Status</th>
+          <th>Notes</th>
+          <th>Requested</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    `;
+    const tbody = table.querySelector("tbody");
+    for (const request of requests) {
+      const row = document.createElement("tr");
+      row.innerHTML = `
+        <td>
+          <strong></strong>
+          <a target="_blank" rel="noreferrer"></a>
+        </td>
+        <td><span class="request-status-pill"></span></td>
+        <td></td>
+        <td></td>
+      `;
+      row.querySelector("strong").textContent = request.name;
+      row.querySelector("a").href = request.careersUrl;
+      row.querySelector("a").textContent = request.careersUrl;
+      const cells = row.querySelectorAll("td");
+      const pill = row.querySelector(".request-status-pill");
+      pill.textContent = requestStatusLabel(request);
+      pill.dataset.status = request.status || "pending";
+      cells[2].textContent = request.notes ? `${request.notes} · ${requestStatusNote(request)}` : requestStatusNote(request);
+      cells[3].textContent = dateLabel(request.createdAt);
+      tbody.append(row);
+    }
+    els.companyRequestList.append(table);
     return;
   }
 
@@ -980,8 +1137,7 @@ function renderCompanyJobResults() {
   for (const job of selectedJobs) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = job.id === selectedJob?.id ? "title-row active" : "title-row";
-    const relevance = relevanceFor(job);
+    button.className = jobTitleRowClass(job, selectedJob);
     button.innerHTML = `<span></span><small></small>`;
     button.querySelector("span").textContent = job.title;
     button.querySelector("small").textContent = jobTitleMetaLabel(job);
@@ -989,7 +1145,9 @@ function renderCompanyJobResults() {
       captureJobPaneScroll();
       state.selectedCompanyJobId = job.id;
       state.jobPaneScroll.detail = 0;
+      markJobViewedLocally(job.id);
       renderCompanyJobResults();
+      markJobViewed(job.id);
     });
     titlePane.append(button);
   }
@@ -1066,6 +1224,10 @@ function renderSelectedJobDetail(job) {
   wrapper.querySelector(".eyebrow").textContent = job.company;
   wrapper.querySelector("h3").textContent = job.title;
   wrapper.querySelector("a").href = job.url;
+  wrapper.querySelector("a").addEventListener("click", () => {
+    markJobViewedLocally(job.id);
+    markJobViewed(job.id);
+  });
   const summaryLabel = job.summarySource === "llm" ? "LLM summary" : job.summarySource === "extracted" ? "Extracted summary" : "Summary";
   wrapper.querySelector(".job-score-line").textContent = `${relevanceScoreLabel(job)} relevance · ${job.relevanceBucket || job.priority} · ${job.detailFetchedAt ? `${summaryLabel} fetched ${dateTimeLabel(job.detailFetchedAt)}` : "Summary fallback"}`;
   wrapper.querySelector(".job-detail-summary").textContent = job.description || "No summary available from this posting.";
@@ -1113,7 +1275,7 @@ function renderSelectedJobDetail(job) {
   }
 
   const statusActions = wrapper.querySelector(".company-job-actions");
-  for (const [nextStatus, label] of [["shortlisted", "Shortlist"], ["applied", "Applied"], ["rejected", "Pass"]]) {
+  for (const [nextStatus, label] of [["shortlisted", "Shortlist"], ["applied", "Applied"], ["rejected", "Not Interested"]]) {
     const statusButton = document.createElement("button");
     statusButton.type = "button";
     statusButton.textContent = label;
@@ -1288,6 +1450,126 @@ function renderScannerRunCard(run, active = false, index = 0) {
   return card;
 }
 
+function renderUserScannerRunCard(run, active = false, expanded = false) {
+  const card = active || expanded ? document.createElement("article") : document.createElement("details");
+  card.className = `scanner-run-card scanner-user-card${active ? " active-scan" : ""}`;
+  const totals = run.totals || {};
+  const issueCount = userRunIssueCount(run);
+  const progress = userScanProgressValues(run);
+
+  if (!active && !expanded) {
+    card.open = state.scannerOpenRunIds.has(run.id);
+    card.addEventListener("toggle", () => {
+      if (card.open) state.scannerOpenRunIds.add(run.id);
+      else state.scannerOpenRunIds.delete(run.id);
+    });
+    const summary = document.createElement("summary");
+    summary.className = "scanner-run-summary";
+    summary.innerHTML = `
+      <div>
+        <p class="eyebrow"></p>
+        <h3></h3>
+        <p></p>
+      </div>
+      <div class="scanner-summary-metrics">
+        <span></span>
+        <span></span>
+        <span></span>
+      </div>
+    `;
+    summary.querySelector(".eyebrow").textContent = `${run.scope || "scan"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
+    summary.querySelector("h3").textContent = dateTimeLabel(run.startedAt);
+    summary.querySelector("p").textContent = issueCount
+      ? `${issueCount} issue${issueCount === 1 ? "" : "s"} found. Previous jobs were kept where scans failed.`
+      : "Completed without company issues.";
+    const summaryMetrics = summary.querySelectorAll(".scanner-summary-metrics span");
+    summaryMetrics[0].textContent = `${totals.jobsFound || 0} saved`;
+    summaryMetrics[1].textContent = `${totals.companies || 0} companies`;
+    summaryMetrics[2].textContent = `${issueCount} issues`;
+    card.append(summary);
+  }
+
+  const body = document.createElement("div");
+  body.className = "scanner-run-body scanner-user-body";
+  body.innerHTML = `
+    <div class="scanner-run-heading">
+      <div>
+        <p class="eyebrow"></p>
+        <h3></h3>
+        <p></p>
+      </div>
+      <span class="scanner-status"></span>
+    </div>
+    <div class="scanner-stat-strip">
+      <span></span>
+      <span></span>
+      <span></span>
+      <span></span>
+    </div>
+    <div class="scan-progress-panel">
+      <p>Scanning your companies and matching jobs to your profile</p>
+      <div class="scan-progress-row">
+        <div>
+          <span>Finding jobs</span>
+          <strong data-progress-label="jobs"></strong>
+        </div>
+        <div class="scan-progress-track"><span data-progress-bar="jobs"></span></div>
+      </div>
+      <div class="scan-progress-row">
+        <div>
+          <span>Matching jobs</span>
+          <strong data-progress-label="matching"></strong>
+        </div>
+        <div class="scan-progress-track"><span data-progress-bar="matching"></span></div>
+      </div>
+    </div>
+    <div class="scanner-user-company-list"></div>
+  `;
+  body.querySelector(".eyebrow").textContent = `${active ? "Running now" : "Scan summary"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
+  body.querySelector("h3").textContent = active ? "Scanning saved companies" : "Latest scan";
+  body.querySelector(".scanner-run-heading p:last-child").textContent = active
+    ? `Started ${dateTimeLabel(run.startedAt)}`
+    : `${dateTimeLabel(run.startedAt)} to ${dateTimeLabel(run.finishedAt)}`;
+  body.querySelector(".scanner-status").textContent = statusText(run.status);
+
+  const statSpans = body.querySelectorAll(".scanner-stat-strip span");
+  statSpans[0].textContent = `${totals.companies || 0} companies`;
+  statSpans[1].textContent = `${totals.rawJobsFound || 0} found`;
+  statSpans[2].textContent = `${totals.jobsFound || 0} saved`;
+  statSpans[3].textContent = `${issueCount} issue${issueCount === 1 ? "" : "s"}`;
+
+  body.querySelector('[data-progress-label="jobs"]').textContent = `${progress.rawJobs} found · ${progress.completedCompanies}/${progress.companyCount} companies`;
+  body.querySelector('[data-progress-label="matching"]').textContent = progress.rawJobs || progress.savedJobs || progress.matchingDone
+    ? `${progress.matchingDone}/${progress.matchingTarget} matched`
+    : "No jobs to match";
+  body.querySelector('[data-progress-bar="jobs"]').style.width = `${progress.jobsPercent}%`;
+  body.querySelector('[data-progress-bar="matching"]').style.width = `${progress.matchingPercent}%`;
+
+  const companyList = body.querySelector(".scanner-user-company-list");
+  const visibleCompanies = active ? (run.companies || []) : scannerIssueCompanies(run);
+  if (visibleCompanies.length) {
+    for (const company of visibleCompanies) {
+      const issueTotal = Number(company.issueCount ?? company.errors?.length ?? 0);
+      const row = document.createElement("div");
+      row.className = `scanner-user-company ${company.status === "failed" || issueTotal ? "has-error" : ""}`;
+      row.innerHTML = `<strong></strong><span></span>`;
+      row.querySelector("strong").textContent = company.name;
+      row.querySelector("span").textContent = active
+        ? `${statusText(company.status)} · ${company.jobsFound || 0} saved${issueTotal ? ` · ${issueTotal} issue${issueTotal === 1 ? "" : "s"}` : ""}`
+        : `${company.jobsFound || 0} saved · ${issueTotal || 1} issue${(issueTotal || 1) === 1 ? "" : "s"}`;
+      companyList.append(row);
+    }
+  } else {
+    const note = document.createElement("p");
+    note.className = "muted-note";
+    note.textContent = active ? "Companies will appear here as the scan starts." : "No company issues in this scan.";
+    companyList.append(note);
+  }
+
+  card.append(body);
+  return card;
+}
+
 function renderScanner() {
   const runs = state.scanRuns || [];
   const localActive = localActiveScanRun();
@@ -1295,10 +1577,20 @@ function renderScanner() {
   const latest = runs[0];
   const metricRun = activeRuns[0] || latest;
   const latestTotals = metricRun?.totals || {};
+  const isAdmin = Boolean(state.currentUser?.isAdmin);
+  els.scannerRunMetricLabel.textContent = "scan runs";
+  els.scannerJobMetricLabel.textContent = isAdmin ? "jobs in latest run" : "jobs saved";
+  els.scannerLlmMetricLabel.textContent = isAdmin ? "LLM calls" : "jobs matched";
+  els.scannerIssueMetricLabel.textContent = "issues";
+  els.scannerPanelEyebrow.textContent = isAdmin ? "Scan debugger" : "Scan status";
+  els.scannerPanelTitle.textContent = isAdmin ? "Scanner activity" : "Scanner status";
+  els.scannerPanelNote.textContent = isAdmin
+    ? "Use this when a company scans but jobs do not appear."
+    : "Track whether your saved companies are scanning and whether new jobs were matched to your profile.";
   els.scannerRunMetric.textContent = activeRuns.length ? "Running" : runs.length;
   els.scannerJobMetric.textContent = latestTotals.jobsFound || 0;
-  els.scannerLlmMetric.textContent = latestTotals.llmCalls || 0;
-  els.scannerIssueMetric.textContent = latestTotals.errors || 0;
+  els.scannerLlmMetric.textContent = isAdmin ? (latestTotals.llmCalls || 0) : scannerMatchedCount(metricRun);
+  els.scannerIssueMetric.textContent = isAdmin ? (latestTotals.errors || 0) : (metricRun ? userRunIssueCount(metricRun) : 0);
   if (els.scannerScanNow) {
     els.scannerScanNow.disabled = Boolean(activeRuns.length);
     els.scannerScanNow.textContent = activeRuns.length ? "Scanning..." : "Scan all companies";
@@ -1307,22 +1599,25 @@ function renderScanner() {
   els.scannerRunList.replaceChildren();
 
   for (const run of activeRuns) {
-    els.scannerCurrent.append(renderScannerRunCard(run, true));
+    els.scannerCurrent.append(isAdmin ? renderScannerRunCard(run, true) : renderUserScannerRunCard(run, true));
   }
 
   if (!runs.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No scan runs logged yet. Start a company scan to see fetches, job counts, LLM calls, and errors here.";
+    empty.textContent = isAdmin
+      ? "No scan runs logged yet. Start a company scan to see fetches, job counts, LLM calls, and errors here."
+      : "No scans yet. Start a company scan to see job matching progress here.";
     els.scannerRunList.append(empty);
     scrollScannerLogsToLatest();
     return;
   }
 
-  for (const run of runs) {
-    els.scannerRunList.append(renderScannerRunCard(run));
+  const visibleRuns = isAdmin ? runs : runs.slice(0, 1);
+  for (const run of visibleRuns) {
+    els.scannerRunList.append(isAdmin ? renderScannerRunCard(run) : renderUserScannerRunCard(run, false, true));
   }
-  scrollScannerLogsToLatest();
+  if (isAdmin) scrollScannerLogsToLatest();
 }
 
 function renderProfile() {
@@ -1406,10 +1701,8 @@ function renderResume() {
 
 function renderPipeline() {
   const columns = [
-    ["new", "New"],
     ["shortlisted", "Shortlisted"],
-    ["applied", "Applied"],
-    ["rejected", "Passed"]
+    ["applied", "Applied"]
   ];
   els.pipeline.replaceChildren();
   for (const [status, title] of columns) {
@@ -1528,6 +1821,24 @@ function render() {
 
 function clearCompanyRequestForm() {
   els.companyRequestForm.reset();
+}
+
+async function markJobViewed(id) {
+  const alreadyPersisted = Boolean(state.statuses?.[id]?.viewedAt);
+  if (!alreadyPersisted) markJobViewedLocally(id);
+  try {
+    const nextState = await api(`/api/jobs/${encodeURIComponent(id)}/viewed`, {
+      method: "POST",
+      body: "{}"
+    });
+    Object.assign(state, nextState);
+    syncSelections();
+    renderMetrics();
+    renderCompanyJobResults();
+    renderPipeline();
+  } catch {
+    // Viewed state is cosmetic; keep the local shade and retry on the next open.
+  }
 }
 
 async function setJobStatus(id, status) {

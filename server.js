@@ -739,6 +739,7 @@ function dedupeTargetCompanies(targetCompanies = []) {
 function normalizeStore(store) {
   return {
     ...store,
+    statuses: store.statuses || {},
     targetCompanies: dedupeTargetCompanies(store.targetCompanies || [])
   };
 }
@@ -1212,10 +1213,61 @@ function addScanRun(store, scanRun) {
   store.scanRuns = [scanRun, ...(store.scanRuns || [])].slice(0, 12);
 }
 
+function scanRunIssueCount(scanRun = {}) {
+  const totals = scanRun.totals || {};
+  const companyIssues = (scanRun.companies || []).reduce((count, company) => {
+    const issueCount = Number(company.issueCount ?? company.errors?.length ?? 0);
+    return count + (Number.isFinite(issueCount) ? issueCount : 0);
+  }, 0);
+  return Math.max(Number(totals.errors || 0), companyIssues);
+}
+
+function sanitizeScannerRun(scanRun = {}) {
+  const totals = scanRun.totals || {};
+  const matchedJobs =
+    Number(totals.llmSucceeded || 0) +
+    Number(totals.llmFailed || 0) +
+    Number(totals.llmCacheHits || 0);
+  return {
+    id: scanRun.id,
+    scope: scanRun.scope,
+    status: scanRun.status,
+    startedAt: scanRun.startedAt,
+    finishedAt: scanRun.finishedAt,
+    totals: {
+      companies: Number(totals.companies || (scanRun.companies || []).length || 0),
+      rawJobsFound: Number(totals.rawJobsFound || 0),
+      jobsFound: Number(totals.jobsFound || 0),
+      matchedJobs,
+      errors: scanRunIssueCount(scanRun)
+    },
+    companies: (scanRun.companies || []).map((company) => ({
+      id: company.id,
+      name: company.name,
+      status: company.status,
+      startedAt: company.startedAt,
+      finishedAt: company.finishedAt,
+      jobsFound: Number(company.jobsFound || 0),
+      issueCount: Number(company.errors?.length || 0)
+    }))
+  };
+}
+
+function sanitizeScannerRuns(scanRuns = []) {
+  return scanRuns.map(sanitizeScannerRun);
+}
+
 function getScannerState(user) {
   const store = readStore(user.id);
+  const activeRuns = [...activeScanRuns.values()].filter((run) => run.userId === user.id);
+  if (!user.isAdmin) {
+    return {
+      activeScanRuns: sanitizeScannerRuns(activeRuns),
+      scanRuns: sanitizeScannerRuns(store.scanRuns || [])
+    };
+  }
   return {
-    activeScanRuns: [...activeScanRuns.values()].filter((run) => run.userId === user.id),
+    activeScanRuns: activeRuns,
     scanRuns: store.scanRuns || []
   };
 }
@@ -4042,9 +4094,18 @@ function resumeRecommendations(profile, resumeText, jobs) {
 function getState(user) {
   const store = readStore(user.id);
   const companyScanJobs = annotateJobs(store.companyScanJobs || [], store.profile, store.jobFeedback || {});
-  const { jobDetailCache, lastGoodCompanyScanJobs, lastGoodScrapeSummary, lastGoodScrapeAt, ...publicStore } = store;
+  const {
+    jobDetailCache,
+    lastGoodCompanyScanJobs,
+    lastGoodScrapeSummary,
+    lastGoodScrapeAt,
+    scanRuns,
+    ...publicStore
+  } = store;
+  const publicScanRuns = user.isAdmin ? (scanRuns || []) : sanitizeScannerRuns(scanRuns || []);
   return {
     ...publicStore,
+    scanRuns: publicScanRuns,
     emailDigest: normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email),
     emailDigestStatus: emailDigestStatus(store),
     currentUser: user,
@@ -4253,7 +4314,10 @@ async function serveStatic(req, res) {
   }
   try {
     const data = await readFile(filePath);
-    res.writeHead(200, { "Content-Type": mimeTypes[path.extname(filePath)] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": mimeTypes[path.extname(filePath)] || "application/octet-stream",
+      "Cache-Control": "no-store"
+    });
     res.end(data);
   } catch {
     res.writeHead(404);
@@ -4576,9 +4640,22 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname.startsWith("/api/jobs/")) {
       const isFeedbackRoute = url.pathname.endsWith("/feedback");
-      const id = decodeURIComponent(url.pathname.replace("/api/jobs/", "").replace("/feedback", ""));
+      const isViewedRoute = url.pathname.endsWith("/viewed");
+      const id = decodeURIComponent(url.pathname.replace("/api/jobs/", "").replace(/\/(feedback|viewed)$/, ""));
       const store = readStore(user.id);
-      const body = await parseBody(req);
+      const body = isViewedRoute ? {} : await parseBody(req);
+      store.statuses = store.statuses || {};
+      if (isViewedRoute) {
+        const existingStatus = store.statuses[id] || {};
+        const viewedAt = existingStatus.viewedAt || new Date().toISOString();
+        store.statuses[id] = {
+          ...existingStatus,
+          viewedAt
+        };
+        writeStore(user.id, store);
+        sendJson(res, 200, getState(user));
+        return;
+      }
       if (isFeedbackRoute) {
         const relevance = body.relevance === "relevant" || body.relevance === "not_relevant" ? body.relevance : null;
         const hasRelevance = Object.prototype.hasOwnProperty.call(body, "relevance");
@@ -4619,12 +4696,18 @@ const server = http.createServer(async (req, res) => {
           return;
         }
       }
-      store.statuses[id] = {
-        ...(store.statuses[id] || {}),
+      const now = new Date().toISOString();
+      const existingStatus = store.statuses[id] || {};
+      const nextEntry = {
+        ...existingStatus,
         status: nextStatus,
-        notes: String(body.notes || store.statuses[id]?.notes || ""),
-        updatedAt: new Date().toISOString()
+        notes: String(body.notes || existingStatus.notes || ""),
+        viewedAt: existingStatus.viewedAt || now,
+        updatedAt: now
       };
+      if (nextStatus === "new") delete nextEntry.status;
+      if (nextEntry.status || nextEntry.viewedAt || nextEntry.notes) store.statuses[id] = nextEntry;
+      else delete store.statuses[id];
       writeStore(user.id, store);
       sendJson(res, 200, getState(user));
       return;

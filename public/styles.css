@@ -428,6 +428,10 @@ textarea {
   font-weight: 800;
 }
 
+.company-tab-button[hidden] {
+  display: none;
+}
+
 .company-tab-button:hover {
   background: #eef4f7;
 }
@@ -861,6 +865,44 @@ details.scanner-run-card {
   margin-top: 12px;
 }
 
+.scanner-user-card .scan-progress-panel {
+  background: #f8fafc;
+  border-color: #d9e1e8;
+}
+
+.scanner-user-company-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.scanner-user-company {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #d9e1e8;
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px 12px;
+}
+
+.scanner-user-company strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.scanner-user-company span {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: right;
+}
+
+.scanner-user-company.has-error {
+  border-color: #fecdca;
+  background: #fffafa;
+}
+
 .scanner-company-row,
 .scanner-company-card {
   border: 1px solid var(--line);
@@ -1040,6 +1082,36 @@ details.scanner-run-card {
 .title-row:hover,
 .title-row.active {
   background: #f0fdfa;
+}
+
+.title-row.viewed {
+  background: #f8fafc;
+}
+
+.title-row.shortlisted {
+  background: #ecfdf3;
+}
+
+.title-row.applied {
+  background: #eff6ff;
+}
+
+.title-row.rejected {
+  background: #f8fafc;
+  color: #667085;
+}
+
+.title-row.rejected span {
+  color: #475467;
+}
+
+.title-row:hover,
+.title-row.active {
+  background: #dff8f3;
+}
+
+.title-row.active {
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .folder-row span,
@@ -1591,6 +1663,10 @@ label span {
   border-collapse: collapse;
 }
 
+.company-request-table.user-request-table {
+  min-width: 680px;
+}
+
 .feedback-table th,
 .feedback-table td,
 .company-request-table th,
@@ -1733,7 +1809,7 @@ label span {
 
 .pipeline {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -1854,6 +1930,15 @@ label span {
   .workspace,
   .sidebar {
     padding: 18px;
+  }
+
+  .scanner-user-company {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .scanner-user-company span {
+    text-align: left;
   }
 
   .job-actions {
