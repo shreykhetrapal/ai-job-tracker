@@ -1356,8 +1356,10 @@ function writeJobDetailCacheEntry(cache, key, job, postingContent, result, scori
     company: job.company,
     jobIdentity: externalJobIdentity(job),
     title: job.title,
+    location: job.location || "",
     url: job.url,
     postedAt: parseJobDate(job.postedAt) || job.postedAt || null,
+    tags: Array.isArray(job.tags) ? job.tags : [],
     postingContent,
     summary: result.summary,
     summarySource: result.source,
@@ -3794,10 +3796,55 @@ function updateCompaniesFromScan(targetCompanies, scanResults) {
     return {
       ...company,
       lastCheckedAt: scan.checkedAt,
-      lastFoundCount: scan.found,
+      lastFoundCount: scan.error ? (company.lastFoundCount ?? 0) : scan.found,
       lastError: scan.error
     };
   });
+}
+
+function successfulScanKeys(scanResults = []) {
+  const ids = new Set();
+  const names = new Set();
+  for (const scan of scanResults) {
+    if (!scan || scan.error) continue;
+    if (scan.id) ids.add(scan.id);
+    if (scan.name) names.add(scan.name);
+  }
+  return { ids, names };
+}
+
+function rememberLastGoodJobBoard(store) {
+  const jobs = store.companyScanJobs || [];
+  if (!jobs.length) return;
+  store.lastGoodCompanyScanJobs = jobs;
+  store.lastGoodScrapeSummary = store.lastScrapeSummary || summarizeCurrentCompanyJobs(store);
+  store.lastGoodScrapeAt = store.lastScrapeAt || null;
+}
+
+function mergeScannedJobs(existingJobs = [], resultJobs = [], scanResults = [], profile, jobFeedback = {}) {
+  const { ids, names } = successfulScanKeys(scanResults);
+  if (!ids.size && !names.size) return annotateJobs(uniqJobs(existingJobs), profile, jobFeedback);
+  const keptJobs = existingJobs.filter((job) => !ids.has(job.companyId) && !names.has(job.company));
+  return annotateJobs(uniqJobs([...keptJobs, ...resultJobs]), profile, jobFeedback);
+}
+
+function applyScanResultToStore(store, result) {
+  rememberLastGoodJobBoard(store);
+  const existingJobs = (store.companyScanJobs || []).length
+    ? store.companyScanJobs
+    : (store.lastGoodCompanyScanJobs || []);
+  store.companyScanJobs = mergeScannedJobs(
+    existingJobs,
+    result.companyScanJobs || [],
+    result.summary?.targetCompanyResults || [],
+    store.profile,
+    store.jobFeedback || {}
+  );
+  store.jobs = store.companyScanJobs;
+  store.jobDetailCache = pruneJobDetailCache(result.jobDetailCache || store.jobDetailCache || {}, store.companyScanJobs);
+  store.targetCompanies = updateCompaniesFromScan(store.targetCompanies, result.summary.targetCompanyResults);
+  store.lastScrapeAt = result.summary.scrapedAt;
+  store.lastScrapeSummary = mergeCompanyScanSummary(store, result);
 }
 
 function mergeCompanyScanSummary(store, result) {
@@ -3995,7 +4042,7 @@ function resumeRecommendations(profile, resumeText, jobs) {
 function getState(user) {
   const store = readStore(user.id);
   const companyScanJobs = annotateJobs(store.companyScanJobs || [], store.profile, store.jobFeedback || {});
-  const { jobDetailCache, ...publicStore } = store;
+  const { jobDetailCache, lastGoodCompanyScanJobs, lastGoodScrapeSummary, lastGoodScrapeAt, ...publicStore } = store;
   return {
     ...publicStore,
     emailDigest: normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email),
@@ -4168,15 +4215,11 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
   const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "email digest", store.resumeText || "", store.jobDetailCache || {}, user.id);
   recordUsage(user.id, "scan", 1);
   recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
-  store.jobs = result.jobs;
-  store.companyScanJobs = result.companyScanJobs;
-  store.jobDetailCache = result.jobDetailCache;
-  store.targetCompanies = updateCompaniesFromScan(store.targetCompanies, result.summary.targetCompanyResults);
-  store.lastScrapeAt = result.summary.scrapedAt;
-  store.lastScrapeSummary = result.summary;
+  const digestScanJobs = result.companyScanJobs || [];
+  applyScanResultToStore(store, result);
   addScanRun(store, result.scanRun);
 
-  const candidates = digestCandidateJobs(result.companyScanJobs, store, sentJobKeys(user.id));
+  const candidates = digestCandidateJobs(digestScanJobs, store, sentJobKeys(user.id));
   if (!candidates.length) {
     store.emailDigest.lastDigestSentAt = new Date().toISOString();
     store.emailDigest.lastDigestStatus = "No new relevant jobs found.";
@@ -4227,12 +4270,7 @@ async function maybeDailyScrape() {
     const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "daily", store.resumeText || "", store.jobDetailCache || {}, user.id);
     recordUsage(user.id, "scan", 1);
     recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
-    store.jobs = result.jobs;
-    store.companyScanJobs = result.companyScanJobs;
-    store.jobDetailCache = result.jobDetailCache;
-    store.targetCompanies = updateCompaniesFromScan(store.targetCompanies, result.summary.targetCompanyResults);
-    store.lastScrapeAt = result.summary.scrapedAt;
-    store.lastScrapeSummary = result.summary;
+    applyScanResultToStore(store, result);
     addScanRun(store, result.scanRun);
     writeStore(user.id, store);
   }
@@ -4503,17 +4541,7 @@ const server = http.createServer(async (req, res) => {
       const result = await scrapeJobs(store.profile, [company], store.jobFeedback || {}, store.companyScanJobs || [], "single company", store.resumeText || "", store.jobDetailCache || {}, user.id);
       recordUsage(user.id, "scan", 1);
       recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
-      const existingJobs = store.companyScanJobs || [];
-      const refreshedCompanyNames = new Set(result.companyScanJobs.map((job) => job.company));
-      store.companyScanJobs = annotateJobs(uniqJobs([
-        ...existingJobs.filter((job) => job.companyId !== id && !refreshedCompanyNames.has(job.company)),
-        ...result.companyScanJobs
-      ]), store.profile, store.jobFeedback || {});
-      store.jobs = store.companyScanJobs;
-      store.jobDetailCache = result.jobDetailCache;
-      store.targetCompanies = updateCompaniesFromScan(store.targetCompanies, result.summary.targetCompanyResults);
-      store.lastScrapeAt = result.summary.scrapedAt;
-      store.lastScrapeSummary = mergeCompanyScanSummary(store, result);
+      applyScanResultToStore(store, result);
       addScanRun(store, result.scanRun);
       writeStore(user.id, store);
       sendJson(res, 200, getState(user));
@@ -4539,12 +4567,7 @@ const server = http.createServer(async (req, res) => {
       const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "manual all", store.resumeText || "", store.jobDetailCache || {}, user.id);
       recordUsage(user.id, "scan", 1);
       recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
-      store.jobs = result.jobs;
-      store.companyScanJobs = result.companyScanJobs;
-      store.jobDetailCache = result.jobDetailCache;
-      store.targetCompanies = updateCompaniesFromScan(store.targetCompanies, result.summary.targetCompanyResults);
-      store.lastScrapeAt = result.summary.scrapedAt;
-      store.lastScrapeSummary = result.summary;
+      applyScanResultToStore(store, result);
       addScanRun(store, result.scanRun);
       writeStore(user.id, store);
       sendJson(res, 200, getState(user));
