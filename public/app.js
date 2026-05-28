@@ -33,7 +33,8 @@ const state = {
   },
   scannerOpenRunIds: new Set(),
   scannerTab: "activity",
-  activeScan: null
+  activeScan: null,
+  sidebarCollapsed: localStorage.getItem("jobTrackerSidebarCollapsed") === "true"
 };
 
 if (window.location.protocol === "file:") {
@@ -43,9 +44,14 @@ if (window.location.protocol === "file:") {
 const apiBase = "";
 
 const els = {
+  appShell: document.querySelector("#appShell"),
+  sidebarToggle: document.querySelector("#sidebarToggle"),
   navButtons: document.querySelectorAll(".nav-button"),
   views: document.querySelectorAll(".view"),
+  viewEyebrow: document.querySelector("#viewEyebrow"),
   viewTitle: document.querySelector("#viewTitle"),
+  viewMeta: document.querySelector("#viewMeta"),
+  topbarUserBadge: document.querySelector("#topbarUserBadge"),
   scanNow: document.querySelector("#scanNow"),
   lastScrape: document.querySelector("#lastScrape"),
   checkLlm: document.querySelector("#checkLlm"),
@@ -125,6 +131,41 @@ const viewTitles = {
   email: "Email Digest",
   scanner: "Scanner",
   feedback: "Feedback",
+};
+
+const viewHeaderMeta = {
+  overview: {
+    eyebrow: "Start here",
+    meta: "A compact workflow for finding, ranking, and tracking roles from your target companies."
+  },
+  companies: {
+    eyebrow: "Company sources",
+    meta: "Choose supported companies, request new parsers, and manage your daily watchlist."
+  },
+  jobs: {
+    eyebrow: "Ranked company roles",
+    meta: "Review scanned roles by company, relevance, date, and your saved tracking state."
+  },
+  pipeline: {
+    eyebrow: "Application workflow",
+    meta: "Keep your shortlisted and applied jobs moving without cluttering the board."
+  },
+  profile: {
+    eyebrow: "Personalization inputs",
+    meta: "Your resume, keywords, locations, and admin tools power job matching."
+  },
+  email: {
+    eyebrow: "Daily digest",
+    meta: "Control when new relevant openings are emailed to you."
+  },
+  scanner: {
+    eyebrow: "Scan status",
+    meta: "Run scans and inspect what was found, matched, cached, or needs attention."
+  },
+  feedback: {
+    eyebrow: "Product feedback",
+    meta: "Share notes that help improve parsers, matching, and the dashboard experience."
+  }
 };
 
 const commonTimeZones = [
@@ -2148,6 +2189,14 @@ function renderView() {
   els.navButtons.forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
   els.views.forEach((view) => view.classList.toggle("active", view.id === `${state.view}View`));
   els.viewTitle.textContent = viewTitles[state.view];
+  const header = viewHeaderMeta[state.view] || viewHeaderMeta.overview;
+  els.viewEyebrow.textContent = header.eyebrow;
+  els.viewMeta.textContent = header.meta;
+  els.appShell.classList.toggle("sidebar-collapsed", Boolean(state.sidebarCollapsed));
+  els.sidebarToggle.setAttribute("aria-pressed", String(Boolean(state.sidebarCollapsed)));
+  els.sidebarToggle.setAttribute("aria-label", state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar");
+  els.sidebarToggle.title = state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar";
+  els.topbarUserBadge.textContent = state.currentUser?.isAdmin ? "Admin workspace" : "Personal workspace";
 }
 
 function render() {
@@ -2441,6 +2490,12 @@ els.navButtons.forEach((button) => {
     state.view = button.dataset.view;
     render();
   });
+});
+
+els.sidebarToggle.addEventListener("click", () => {
+  state.sidebarCollapsed = !state.sidebarCollapsed;
+  localStorage.setItem("jobTrackerSidebarCollapsed", String(state.sidebarCollapsed));
+  renderView();
 });
 
 els.companyTabButtons.forEach((button) => {

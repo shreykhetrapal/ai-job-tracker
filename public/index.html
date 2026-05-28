@@ -4,30 +4,71 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Job Application Dashboard</title>
-    <link rel="stylesheet" href="./styles.css?v=email-digest-limit-1" />
+    <link rel="stylesheet" href="./styles.css?v=blue-dashboard-2" />
   </head>
   <body>
-    <main class="app-shell">
+    <main id="appShell" class="app-shell">
       <aside class="sidebar">
-        <div>
-          <p class="eyebrow">Daily company scanner</p>
-          <h1>Company Jobs</h1>
+        <div class="sidebar-header">
+          <div class="brand-mark" aria-hidden="true">AJ</div>
+          <div class="brand-copy">
+            <p class="eyebrow">Daily company scanner</p>
+            <h1>Company Jobs</h1>
+          </div>
+          <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="Collapse sidebar" aria-pressed="false" title="Collapse sidebar">
+            <span aria-hidden="true"></span>
+          </button>
         </div>
-        <nav aria-label="Dashboard sections">
-          <a class="nav-button active" data-view="overview" href="#overview">Overview</a>
-          <a class="nav-button" data-view="companies" href="#companies">Companies</a>
-          <a class="nav-button" data-view="jobs" href="#jobs">Job Board</a>
-          <a class="nav-button" data-view="pipeline" href="#pipeline">Pipeline</a>
-          <a class="nav-button" data-view="profile" href="#profile">Profile</a>
-          <a class="nav-button" data-view="email" href="#email">Email Digest</a>
-          <a class="nav-button" data-view="scanner" href="#scanner">Scanner</a>
-          <a class="nav-button" data-view="feedback" href="#feedback">Feedback</a>
+        <nav class="sidebar-nav" aria-label="Dashboard sections">
+          <div class="nav-group">
+            <p class="nav-group-label">Start</p>
+            <a class="nav-button active" data-view="overview" href="#overview" aria-label="Overview">
+              <span class="nav-icon" aria-hidden="true">OV</span>
+              <span class="nav-label">Overview</span>
+            </a>
+          </div>
+          <div class="nav-group">
+            <p class="nav-group-label">Workflow</p>
+            <a class="nav-button" data-view="companies" href="#companies" aria-label="Companies">
+              <span class="nav-icon" aria-hidden="true">CO</span>
+              <span class="nav-label">Companies</span>
+            </a>
+            <a class="nav-button" data-view="jobs" href="#jobs" aria-label="Job Board">
+              <span class="nav-icon" aria-hidden="true">JB</span>
+              <span class="nav-label">Job Board</span>
+            </a>
+            <a class="nav-button" data-view="pipeline" href="#pipeline" aria-label="Pipeline">
+              <span class="nav-icon" aria-hidden="true">PL</span>
+              <span class="nav-label">Pipeline</span>
+            </a>
+          </div>
+          <div class="nav-group">
+            <p class="nav-group-label">Settings</p>
+            <a class="nav-button" data-view="profile" href="#profile" aria-label="Profile">
+              <span class="nav-icon" aria-hidden="true">PR</span>
+              <span class="nav-label">Profile</span>
+            </a>
+            <a class="nav-button" data-view="email" href="#email" aria-label="Email Digest">
+              <span class="nav-icon" aria-hidden="true">EM</span>
+              <span class="nav-label">Email Digest</span>
+            </a>
+            <a class="nav-button" data-view="scanner" href="#scanner" aria-label="Scanner">
+              <span class="nav-icon" aria-hidden="true">SC</span>
+              <span class="nav-label">Scanner</span>
+            </a>
+            <a class="nav-button" data-view="feedback" href="#feedback" aria-label="Feedback">
+              <span class="nav-icon" aria-hidden="true">FB</span>
+              <span class="nav-label">Feedback</span>
+            </a>
+          </div>
         </nav>
         <div class="user-panel">
+          <span class="panel-label">Account</span>
           <p id="currentUserEmail">Signed in</p>
           <button id="logoutButton" type="button">Log out</button>
         </div>
         <div class="scrape-panel">
+          <span class="panel-label">Scanner</span>
           <p id="lastScrape">No scan yet</p>
           <button id="scanNow" class="primary-button">Scan all companies</button>
           <div class="llm-panel">
@@ -40,8 +81,12 @@
       <section class="workspace">
         <header class="topbar">
           <div>
-            <p class="eyebrow">Your saved companies, scanned daily</p>
+            <p id="viewEyebrow" class="eyebrow">Your saved companies, scanned daily</p>
             <h2 id="viewTitle">Overview</h2>
+            <p id="viewMeta" class="topbar-meta">Turn company lists into a prioritized application queue.</p>
+          </div>
+          <div class="topbar-actions">
+            <span id="topbarUserBadge" class="status-chip">Signed in</span>
           </div>
         </header>
 
@@ -422,6 +467,6 @@
       </section>
     </main>
 
-    <script type="module" src="./app.js?v=email-digest-limit-1"></script>
+    <script type="module" src="./app.js?v=blue-dashboard-2"></script>
   </body>
 </html>
