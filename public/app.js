@@ -381,22 +381,33 @@ function scannerRunCacheLabel(run) {
 
 function emailDigestStatusLabel(emailDigest) {
   if (!emailDigest) return "";
-  if (emailDigest.status === "sent") return `Email digest sent ${emailDigest.sentCount || 0} job${Number(emailDigest.sentCount || 0) === 1 ? "" : "s"}`;
-  if (emailDigest.status === "no_matches") return "Email digest found no new jobs to send";
+  const sentCount = Number(emailDigest.sentCount || 0);
+  const newMatches = Number(emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0);
+  if (emailDigest.status === "sent") return `Email digest sent ${sentCount} of ${newMatches} new opening${newMatches === 1 ? "" : "s"}`;
+  if (emailDigest.status === "no_matches") return "Email digest found no new openings to send";
   return "Email digest checked jobs";
 }
 
 function renderScannerEmailDigest(run) {
   const emailDigest = run?.emailDigest;
   if (!emailDigest) return null;
+  const sentCount = Number(emailDigest.sentCount || 0);
+  const newMatches = Number(emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0);
+  const maxShown = Number(emailDigest.maxShown || 10);
+  const hiddenCount = Math.max(0, newMatches - sentCount);
   const wrap = document.createElement("section");
   wrap.className = "scanner-email-summary";
   wrap.innerHTML = `<h4></h4><p></p><div class="scanner-email-job-list"></div>`;
   wrap.querySelector("h4").textContent = emailDigestStatusLabel(emailDigest);
   wrap.querySelector("p").textContent = [
+    `${newMatches} new relevant opening${newMatches === 1 ? "" : "s"}`,
+    `${sentCount} sent`,
+    `${emailDigest.cachedDetailHits || 0} cached details`,
+    `${emailDigest.cachedLlmHits || 0} cached LLM matches`,
+    `${emailDigest.llmCalls || 0} LLM calls`,
     emailDigest.recipient ? `Recipient ${emailDigest.recipient}` : "",
     emailDigest.checkedAt ? `Checked ${dateTimeLabel(emailDigest.checkedAt)}` : "",
-    `${(emailDigest.jobs || []).length} listed below`
+    hiddenCount ? `Top ${Math.min(maxShown, sentCount)} shown · ${hiddenCount} more in dashboard` : `${(emailDigest.jobs || []).length} listed below`
   ].filter(Boolean).join(" · ");
   const list = wrap.querySelector(".scanner-email-job-list");
   if (!(emailDigest.jobs || []).length) {
@@ -1495,6 +1506,8 @@ function renderScannerRunCard(run, active = false, index = 0) {
   }
   const totals = run.totals || {};
   const issueCount = runIssueCount(run);
+  const emailDigest = run.emailDigest || null;
+  const isEmailDigestRun = Boolean(emailDigest) || run.scope === "email digest";
 
   if (!active) {
     const summary = document.createElement("summary");
@@ -1511,13 +1524,13 @@ function renderScannerRunCard(run, active = false, index = 0) {
         <span></span>
       </div>
     `;
-    summary.querySelector(".eyebrow").textContent = `${run.scope || "scan"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
+    summary.querySelector(".eyebrow").textContent = `${isEmailDigestRun ? "Email digest" : run.scope || "scan"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
     summary.querySelector("h3").textContent = dateTimeLabel(run.startedAt);
-    summary.querySelector("p").textContent = runFailureSummary(run);
+    summary.querySelector("p").textContent = emailDigest ? emailDigestStatusLabel(emailDigest) : runFailureSummary(run);
     const summaryMetrics = summary.querySelectorAll(".scanner-summary-metrics span");
-    summaryMetrics[0].textContent = `${totals.jobsFound || 0} jobs`;
-    summaryMetrics[1].textContent = `${issueCount} failures`;
-    summaryMetrics[2].textContent = `${totals.detailCacheHits || 0} cached`;
+    summaryMetrics[0].textContent = emailDigest ? `${emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0} new` : `${totals.jobsFound || 0} jobs`;
+    summaryMetrics[1].textContent = emailDigest ? `${emailDigest.sentCount || 0} sent` : `${issueCount} failures`;
+    summaryMetrics[2].textContent = emailDigest ? `${emailDigest.cachedDetailHits || 0}/${emailDigest.cachedLlmHits || 0} cached` : `${totals.detailCacheHits || 0} cached`;
     card.append(summary);
   }
 
@@ -1559,17 +1572,17 @@ function renderScannerRunCard(run, active = false, index = 0) {
     <div class="scanner-company-list"></div>
   `;
   body.querySelector(".eyebrow").textContent = `${active ? "Running now" : "Details"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
-  body.querySelector("h3").textContent = active ? `${statusText(run.scope)} scan` : `Run details`;
+  body.querySelector("h3").textContent = isEmailDigestRun ? "Email digest scan" : active ? `${statusText(run.scope)} scan` : `Run details`;
   body.querySelector(".scanner-run-heading p:last-child").textContent = active
     ? `Started ${dateTimeLabel(run.startedAt)}`
     : `${dateTimeLabel(run.startedAt)} to ${dateTimeLabel(run.finishedAt)}`;
   body.querySelector(".scanner-status").textContent = statusText(run.status);
 
   const statSpans = body.querySelectorAll(".scanner-stat-strip span");
-  statSpans[0].textContent = `${totals.companies || 0} companies`;
-  statSpans[1].textContent = `${totals.rawJobsFound || 0} raw jobs`;
-  statSpans[2].textContent = `${totals.jobsFound || 0} saved jobs`;
-  statSpans[3].textContent = `${totals.llmCalls || 0} LLM calls (${totals.llmSucceeded || 0} ok, ${totals.llmFailed || 0} failed, ${totals.llmCacheHits || 0} cached)`;
+  statSpans[0].textContent = emailDigest ? `${emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0} new relevant openings` : `${totals.companies || 0} companies`;
+  statSpans[1].textContent = emailDigest ? `${emailDigest.sentCount || 0} emailed` : `${totals.rawJobsFound || 0} raw jobs`;
+  statSpans[2].textContent = emailDigest ? `${emailDigest.cachedDetailHits || 0} cached details` : `${totals.jobsFound || 0} saved jobs`;
+  statSpans[3].textContent = emailDigest ? `${emailDigest.llmCalls || 0} LLM calls · ${emailDigest.cachedLlmHits || 0} cached LLM` : `${totals.llmCalls || 0} LLM calls (${totals.llmSucceeded || 0} ok, ${totals.llmFailed || 0} failed, ${totals.llmCacheHits || 0} cached)`;
   statSpans[4].textContent = `${issueCount} failures · ${totals.pageFetches || 0} page fetches · ${totals.metaApiCalls || 0} API · ${totals.detailFetches || 0} details · ${totals.detailCacheHits || 0} cached details`;
 
   const emailDigestSummary = renderScannerEmailDigest(run);
@@ -1739,6 +1752,8 @@ function renderUserScannerRunCard(run, active = false, expanded = false) {
   const totals = run.totals || {};
   const issueCount = userRunIssueCount(run);
   const progress = userScanProgressValues(run);
+  const emailDigest = run.emailDigest || null;
+  const isEmailDigestRun = Boolean(emailDigest) || run.scope === "email digest";
 
   if (!active && !expanded) {
     card.open = state.scannerOpenRunIds.has(run.id);
@@ -1760,14 +1775,14 @@ function renderUserScannerRunCard(run, active = false, expanded = false) {
         <span></span>
       </div>
     `;
-    summary.querySelector(".eyebrow").textContent = `${run.scope || "scan"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
+    summary.querySelector(".eyebrow").textContent = `${isEmailDigestRun ? "Email digest" : run.scope || "scan"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
     summary.querySelector("h3").textContent = dateTimeLabel(run.startedAt);
-    summary.querySelector("p").textContent = issueCount
+    summary.querySelector("p").textContent = emailDigest ? emailDigestStatusLabel(emailDigest) : issueCount
       ? `${issueCount} issue${issueCount === 1 ? "" : "s"} found. Previous jobs were kept where scans failed.`
       : "Completed without company issues.";
     const summaryMetrics = summary.querySelectorAll(".scanner-summary-metrics span");
-    summaryMetrics[0].textContent = `${totals.jobsFound || 0} saved`;
-    summaryMetrics[1].textContent = `${totals.companies || 0} companies`;
+    summaryMetrics[0].textContent = emailDigest ? `${emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0} new` : `${totals.jobsFound || 0} saved`;
+    summaryMetrics[1].textContent = emailDigest ? `${emailDigest.sentCount || 0} emailed` : `${totals.companies || 0} companies`;
     summaryMetrics[2].textContent = `${issueCount} issues`;
     card.append(summary);
   }
@@ -1809,16 +1824,16 @@ function renderUserScannerRunCard(run, active = false, expanded = false) {
     <div class="scanner-user-company-list"></div>
   `;
   body.querySelector(".eyebrow").textContent = `${active ? "Running now" : "Scan summary"} · ${durationLabel(run.startedAt, run.finishedAt)}`;
-  body.querySelector("h3").textContent = active ? "Scanning saved companies" : "Latest scan";
+  body.querySelector("h3").textContent = isEmailDigestRun ? "Email digest scan" : active ? "Scanning saved companies" : "Latest scan";
   body.querySelector(".scanner-run-heading p:last-child").textContent = active
     ? `Started ${dateTimeLabel(run.startedAt)}`
     : `${dateTimeLabel(run.startedAt)} to ${dateTimeLabel(run.finishedAt)}`;
   body.querySelector(".scanner-status").textContent = statusText(run.status);
 
   const statSpans = body.querySelectorAll(".scanner-stat-strip span");
-  statSpans[0].textContent = `${totals.companies || 0} companies`;
-  statSpans[1].textContent = `${totals.rawJobsFound || 0} found`;
-  statSpans[2].textContent = `${totals.jobsFound || 0} saved`;
+  statSpans[0].textContent = emailDigest ? `${emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0} new openings` : `${totals.companies || 0} companies`;
+  statSpans[1].textContent = emailDigest ? `${emailDigest.sentCount || 0} emailed` : `${totals.rawJobsFound || 0} found`;
+  statSpans[2].textContent = emailDigest ? `${emailDigest.cachedDetailHits || 0} cached details` : `${totals.jobsFound || 0} saved`;
   statSpans[3].textContent = `${issueCount} issue${issueCount === 1 ? "" : "s"}`;
 
   body.querySelector('[data-progress-label="jobs"]').textContent = `${progress.rawJobs} found · ${progress.completedCompanies}/${progress.companyCount} companies`;
@@ -1893,10 +1908,11 @@ function renderScanner() {
   const metricRun = activeRuns[0] || latest;
   const latestTotals = metricRun?.totals || {};
   const isAdmin = Boolean(state.currentUser?.isAdmin);
+  const metricEmailDigest = metricRun?.emailDigest || null;
   renderScannerTabs(isAdmin);
   els.scannerRunMetricLabel.textContent = "scan runs";
-  els.scannerJobMetricLabel.textContent = isAdmin ? "jobs in latest run" : "jobs saved";
-  els.scannerLlmMetricLabel.textContent = isAdmin ? "LLM calls" : "jobs matched";
+  els.scannerJobMetricLabel.textContent = isAdmin && metricEmailDigest ? "new openings" : isAdmin ? "jobs in latest run" : "jobs saved";
+  els.scannerLlmMetricLabel.textContent = isAdmin && metricEmailDigest ? "emails sent" : isAdmin ? "LLM calls" : "jobs matched";
   els.scannerIssueMetricLabel.textContent = "issues";
   els.scannerPanelEyebrow.textContent = isAdmin ? "Scan debugger" : "Scan status";
   els.scannerPanelTitle.textContent = isAdmin ? "Scanner activity" : "Scanner status";
@@ -1904,8 +1920,10 @@ function renderScanner() {
     ? "Use this when a company scans but jobs do not appear."
     : "Track whether your saved companies are scanning and whether new jobs were matched to your profile.";
   els.scannerRunMetric.textContent = activeRuns.length ? "Running" : runs.length;
-  els.scannerJobMetric.textContent = latestTotals.jobsFound || 0;
-  els.scannerLlmMetric.textContent = isAdmin ? (latestTotals.llmCalls || 0) : scannerMatchedCount(metricRun);
+  els.scannerJobMetric.textContent = metricEmailDigest ? (metricEmailDigest.newMatchesFound || metricEmailDigest.totalEligibleCount || 0) : (latestTotals.jobsFound || 0);
+  els.scannerLlmMetric.textContent = isAdmin
+    ? (metricEmailDigest ? (metricEmailDigest.sentCount || 0) : (latestTotals.llmCalls || 0))
+    : scannerMatchedCount(metricRun);
   els.scannerIssueMetric.textContent = isAdmin ? (latestTotals.errors || 0) : (metricRun ? userRunIssueCount(metricRun) : 0);
   if (els.scannerScanNow) {
     els.scannerScanNow.disabled = Boolean(activeRuns.length);

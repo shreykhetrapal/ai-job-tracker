@@ -28,6 +28,8 @@ const OPENAI_SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || "gpt-5-nano";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
+const EMAIL_DIGEST_MAX_SHOWN = 10;
+const DASHBOARD_URL = process.env.PUBLIC_APP_URL || process.env.APP_URL || "https://ai-job-tracker.com/#jobs";
 const emailPattern = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 
 const jobMatchResponseFormat = {
@@ -1238,6 +1240,12 @@ function sanitizeEmailDigestScan(emailDigest = {}) {
     status: emailDigest.status || "",
     recipient: emailDigest.recipient || "",
     sentCount: Number(emailDigest.sentCount || 0),
+    newMatchesFound: Number(emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0),
+    totalEligibleCount: Number(emailDigest.totalEligibleCount || emailDigest.newMatchesFound || 0),
+    maxShown: Number(emailDigest.maxShown || EMAIL_DIGEST_MAX_SHOWN),
+    cachedDetailHits: Number(emailDigest.cachedDetailHits || 0),
+    cachedLlmHits: Number(emailDigest.cachedLlmHits || 0),
+    llmCalls: Number(emailDigest.llmCalls || 0),
     checkedAt: emailDigest.checkedAt || "",
     jobs: (emailDigest.jobs || []).map((job) => ({
       id: job.id,
@@ -4277,17 +4285,19 @@ function shouldRunEmailDigest(settings) {
   return Boolean(nowParts && nowParts.minutes >= targetMinutes);
 }
 
-function digestCandidateJobs(jobs, store, sentKeys) {
+function digestEligibleJobs(jobs, store, sentKeys) {
   const settings = store.emailDigest || {};
   const minScore = clampRelevanceScore(settings.minRelevanceScore) ?? 7;
-  const maxJobs = Number(settings.maxJobs || 10);
   return (jobs || [])
     .filter((job) => !sentKeys.has(jobDetailCacheKey(job)))
     .filter((job) => (clampRelevanceScore(job.relevanceScore) ?? 0) >= minScore)
     .filter((job) => job.locationMatchesProfile !== "No" && (!job.locationStatus || job.locationStatus === "match"))
     .filter((job) => !["applied", "rejected"].includes(store.statuses?.[job.id]?.status))
-    .sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0) || (b.score || 0) - (a.score || 0) || safeDate(b.postedAt) - safeDate(a.postedAt))
-    .slice(0, Number.isFinite(maxJobs) ? Math.max(1, Math.min(50, Math.round(maxJobs))) : 10);
+    .sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0) || (b.score || 0) - (a.score || 0) || safeDate(b.postedAt) - safeDate(a.postedAt));
+}
+
+function digestCandidateJobs(jobs, store, sentKeys) {
+  return digestEligibleJobs(jobs, store, sentKeys).slice(0, EMAIL_DIGEST_MAX_SHOWN);
 }
 
 function digestJobPreview(job) {
@@ -4305,15 +4315,39 @@ function digestJobPreview(job) {
   };
 }
 
-function renderDigestEmail(user, jobs, settings) {
+function emailDigestScanSummary(scanRun, settings, candidates, eligibleCount, status, digestId = "") {
+  const totals = scanRun?.totals || {};
+  return {
+    status,
+    recipient: settings.email,
+    sentCount: candidates.length,
+    newMatchesFound: Number(eligibleCount || 0),
+    totalEligibleCount: Number(eligibleCount || 0),
+    maxShown: EMAIL_DIGEST_MAX_SHOWN,
+    cachedDetailHits: Number(totals.detailCacheHits || 0),
+    cachedLlmHits: Number(totals.llmCacheHits || 0),
+    llmCalls: Number(totals.llmCalls || 0),
+    checkedAt: new Date().toISOString(),
+    ...(digestId ? { digestId } : {}),
+    jobs: candidates.map(digestJobPreview)
+  };
+}
+
+function renderDigestEmail(user, jobs, settings, totalEligibleCount = jobs.length) {
   const grouped = new Map();
   for (const job of jobs) {
     if (!grouped.has(job.company)) grouped.set(job.company, []);
     grouped.get(job.company).push(job);
   }
-  const subject = `${jobs.length} new relevant job${jobs.length === 1 ? "" : "s"} for you`;
-  const intro = `Here are new roles from your saved companies with relevance ${settings.minRelevanceScore}/10 or higher.`;
-  const textLines = [intro, ""];
+  const hiddenCount = Math.max(0, Number(totalEligibleCount || 0) - jobs.length);
+  const subject = hiddenCount
+    ? `Top ${jobs.length} of ${totalEligibleCount} new job openings for you`
+    : `${jobs.length} new job opening${jobs.length === 1 ? "" : "s"} for you`;
+  const intro = hiddenCount
+    ? `Showing the top ${jobs.length} of ${totalEligibleCount} new relevant openings from your saved companies.`
+    : `Here are ${jobs.length} new relevant opening${jobs.length === 1 ? "" : "s"} from your saved companies.`;
+  const dashboardNote = hiddenCount ? `Showing the top ${jobs.length}. Visit the dashboard to review the remaining ${hiddenCount}.` : "";
+  const textLines = [intro, dashboardNote ? `${dashboardNote} ${DASHBOARD_URL}` : "", ""].filter(Boolean);
   const htmlSections = [];
   for (const [company, companyJobs] of grouped.entries()) {
     textLines.push(company);
@@ -4342,6 +4376,7 @@ function renderDigestEmail(user, jobs, settings) {
     <div style="font-family:Inter,Arial,sans-serif;color:#202124;max-width:720px;margin:0 auto;">
       <h1 style="font-size:22px;margin:0 0 8px;">${escapeHtml(subject)}</h1>
       <p style="color:#475467;line-height:1.5;">${escapeHtml(intro)}</p>
+      ${dashboardNote ? `<p style="color:#344054;line-height:1.5;"><strong>${escapeHtml(dashboardNote)}</strong> <a href="${escapeHtml(DASHBOARD_URL)}" style="color:#0f766e;">Open dashboard</a></p>` : ""}
       ${htmlSections.join("")}
       <p style="color:#667085;font-size:12px;margin-top:24px;">Sent by AI Job Tracker for ${escapeHtml(user.email)}.</p>
     </div>
@@ -4593,15 +4628,10 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
   applyScanResultToStore(store, result);
   addScanRun(store, result.scanRun);
 
-  const candidates = digestCandidateJobs(digestScanJobs, store, sentJobKeys(user.id));
+  const eligibleCandidates = digestEligibleJobs(digestScanJobs, store, sentJobKeys(user.id));
+  const candidates = eligibleCandidates.slice(0, EMAIL_DIGEST_MAX_SHOWN);
   if (!candidates.length) {
-    result.scanRun.emailDigest = {
-      status: "no_matches",
-      recipient: settings.email,
-      sentCount: 0,
-      checkedAt: new Date().toISOString(),
-      jobs: []
-    };
+    result.scanRun.emailDigest = emailDigestScanSummary(result.scanRun, settings, [], eligibleCandidates.length, "no_matches");
     store.emailDigest.lastDigestSentAt = new Date().toISOString();
     store.emailDigest.lastDigestStatus = "No new relevant jobs found.";
     writeStore(user.id, store);
@@ -4609,19 +4639,12 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
   }
 
   const digestId = `digest-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`;
-  const message = renderDigestEmail(user, candidates, settings);
+  const message = renderDigestEmail(user, candidates, settings, eligibleCandidates.length);
   await sendEmail({ to: settings.email, ...message });
   recordEmailDigestSends(user.id, digestId, candidates);
-  result.scanRun.emailDigest = {
-    status: "sent",
-    recipient: settings.email,
-    sentCount: candidates.length,
-    checkedAt: new Date().toISOString(),
-    digestId,
-    jobs: candidates.map(digestJobPreview)
-  };
+  result.scanRun.emailDigest = emailDigestScanSummary(result.scanRun, settings, candidates, eligibleCandidates.length, "sent", digestId);
   store.emailDigest.lastDigestSentAt = new Date().toISOString();
-  store.emailDigest.lastDigestStatus = `Sent ${candidates.length} job${candidates.length === 1 ? "" : "s"} to ${settings.email}.`;
+  store.emailDigest.lastDigestStatus = `Sent ${candidates.length} of ${eligibleCandidates.length} new relevant opening${eligibleCandidates.length === 1 ? "" : "s"} to ${settings.email}.`;
   writeStore(user.id, store);
   return { sent: true, count: candidates.length };
 }
