@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Job Application Dashboard</title>
-    <link rel="stylesheet" href="./styles.css?v=simple-scanner-2" />
+    <link rel="stylesheet" href="./styles.css?v=location-scoring-1" />
   </head>
   <body>
     <main class="app-shell">
@@ -214,8 +214,17 @@
               </div>
               <button id="scannerScanNow" class="primary-button" type="button">Scan all companies</button>
             </div>
-            <div id="scannerCurrent" class="scanner-current"></div>
-            <div id="scannerRunList" class="scanner-run-list"></div>
+            <div class="scanner-tabs" role="tablist" aria-label="Scanner views">
+              <button class="scanner-tab-button active" type="button" role="tab" aria-selected="true" data-scanner-tab="activity">Activity</button>
+              <button class="scanner-tab-button" type="button" role="tab" aria-selected="false" data-scanner-tab="failures" data-admin-only="true">Failed scans</button>
+            </div>
+            <div class="scanner-tab-panel active" role="tabpanel" data-scanner-panel="activity">
+              <div id="scannerCurrent" class="scanner-current"></div>
+              <div id="scannerRunList" class="scanner-run-list"></div>
+            </div>
+            <div class="scanner-tab-panel" role="tabpanel" data-scanner-panel="failures" data-admin-only="true" hidden>
+              <div id="scannerFailureList" class="scanner-run-list"></div>
+            </div>
           </section>
         </section>
 
@@ -369,7 +378,7 @@
                 <select name="timeZone" id="emailTimeZone"></select>
               </label>
               <label>
-                <span>Minimum relevance score</span>
+                <span>Minimum relevance score (High starts at 8)</span>
                 <input name="minRelevanceScore" type="number" min="0" max="10" step="1" />
               </label>
               <label>
@@ -413,6 +422,6 @@
       </section>
     </main>
 
-    <script type="module" src="./app.js?v=companies-clean-1"></script>
+    <script type="module" src="./app.js?v=location-scoring-1"></script>
   </body>
 </html>

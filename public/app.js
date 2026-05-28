@@ -9,6 +9,7 @@ const state = {
   jobFeedback: {},
   statuses: {},
   scanRuns: [],
+  failedScanRuns: [],
   activeScanRuns: [],
   feedbackEntries: [],
   emailDigest: {},
@@ -22,6 +23,8 @@ const state = {
   selectedCompanyJobId: null,
   jobTitleSort: "relevance",
   jobTitleSortDirection: "desc",
+  jobRelevanceBuckets: ["High"],
+  jobRelevanceAutoSelected: true,
   jobTitleSearch: "",
   jobPaneScroll: {
     companies: 0,
@@ -29,6 +32,7 @@ const state = {
     detail: 0
   },
   scannerOpenRunIds: new Set(),
+  scannerTab: "activity",
   activeScan: null
 };
 
@@ -67,8 +71,11 @@ const els = {
   scannerPanelEyebrow: document.querySelector("#scannerPanelEyebrow"),
   scannerPanelTitle: document.querySelector("#scannerPanelTitle"),
   scannerPanelNote: document.querySelector("#scannerPanelNote"),
+  scannerTabButtons: document.querySelectorAll(".scanner-tab-button"),
+  scannerTabPanels: document.querySelectorAll(".scanner-tab-panel"),
   scannerCurrent: document.querySelector("#scannerCurrent"),
   scannerRunList: document.querySelector("#scannerRunList"),
+  scannerFailureList: document.querySelector("#scannerFailureList"),
   scannerScanNow: document.querySelector("#scannerScanNow"),
   companyTabButtons: document.querySelectorAll(".company-tab-button"),
   companyTabPanels: document.querySelectorAll(".company-tab-panel"),
@@ -134,6 +141,8 @@ const commonTimeZones = [
   "Australia/Sydney",
   "UTC"
 ];
+
+const relevanceBucketOrder = ["High", "Medium", "Low"];
 
 function viewFromHash() {
   const view = window.location.hash.replace("#", "");
@@ -354,6 +363,64 @@ function scannerIssueCompanies(run) {
   });
 }
 
+function scannerFailureCompanies(run) {
+  return (run.companies || []).filter((company) => {
+    const callIssues = (company.calls || []).some((call) => call.status === "error");
+    const issueCount = Number(company.issueCount ?? company.errors?.length ?? 0);
+    return company.status === "failed" || issueCount > 0 || callIssues;
+  });
+}
+
+function scannerRunCacheLabel(run) {
+  const totals = run?.totals || {};
+  const detailCacheHits = Number(totals.detailCacheHits || 0);
+  const llmCacheHits = Number(totals.llmCacheHits || 0);
+  if (!detailCacheHits && !llmCacheHits) return "No cache hits";
+  return `${detailCacheHits} detail cache hit${detailCacheHits === 1 ? "" : "s"} · ${llmCacheHits} LLM cache hit${llmCacheHits === 1 ? "" : "s"}`;
+}
+
+function emailDigestStatusLabel(emailDigest) {
+  if (!emailDigest) return "";
+  if (emailDigest.status === "sent") return `Email digest sent ${emailDigest.sentCount || 0} job${Number(emailDigest.sentCount || 0) === 1 ? "" : "s"}`;
+  if (emailDigest.status === "no_matches") return "Email digest found no new jobs to send";
+  return "Email digest checked jobs";
+}
+
+function renderScannerEmailDigest(run) {
+  const emailDigest = run?.emailDigest;
+  if (!emailDigest) return null;
+  const wrap = document.createElement("section");
+  wrap.className = "scanner-email-summary";
+  wrap.innerHTML = `<h4></h4><p></p><div class="scanner-email-job-list"></div>`;
+  wrap.querySelector("h4").textContent = emailDigestStatusLabel(emailDigest);
+  wrap.querySelector("p").textContent = [
+    emailDigest.recipient ? `Recipient ${emailDigest.recipient}` : "",
+    emailDigest.checkedAt ? `Checked ${dateTimeLabel(emailDigest.checkedAt)}` : "",
+    `${(emailDigest.jobs || []).length} listed below`
+  ].filter(Boolean).join(" · ");
+  const list = wrap.querySelector(".scanner-email-job-list");
+  if (!(emailDigest.jobs || []).length) {
+    const empty = document.createElement("p");
+    empty.textContent = "No digest jobs met the send threshold for this run.";
+    list.append(empty);
+    return wrap;
+  }
+  for (const job of emailDigest.jobs || []) {
+    const item = document.createElement("article");
+    item.className = "scanner-email-job";
+    item.innerHTML = `<a target="_blank" rel="noreferrer"></a><span></span>`;
+    item.querySelector("a").href = job.url || "#";
+    item.querySelector("a").textContent = `${job.company || "Company"} · ${job.title || "Untitled job"}`;
+    item.querySelector("span").textContent = [
+      job.location || "Location not listed",
+      Number.isFinite(Number(job.relevanceScore)) ? `${normalizeRelevanceBucket(job.relevanceBucket, job.relevanceScore)} · ${Number(job.relevanceScore)}/10 relevance` : normalizeRelevanceBucket(job.relevanceBucket),
+      job.postedAt ? `Posted ${dateLabel(job.postedAt)}` : ""
+    ].filter(Boolean).join(" · ");
+    list.append(item);
+  }
+  return wrap;
+}
+
 function scannerLogLine(call) {
   const timestamp = call.at ? new Date(call.at) : null;
   const time = timestamp && !Number.isNaN(timestamp.getTime())
@@ -410,8 +477,32 @@ function manualRelevanceScoreFor(job) {
   return Number.isFinite(score) ? score : null;
 }
 
+function relevanceBucketFromScore(score) {
+  const normalized = Number(score);
+  if (!Number.isFinite(normalized)) return "Low";
+  if (normalized >= 8) return "High";
+  if (normalized >= 5) return "Medium";
+  return "Low";
+}
+
+function normalizeRelevanceBucket(value, score = null) {
+  const numericScore = Number(score);
+  if (Number.isFinite(numericScore)) return relevanceBucketFromScore(numericScore);
+  const text = String(value || "").trim().toLowerCase();
+  if (text === "high" || text === "excellent" || text === "strong") return "High";
+  if (text === "medium" || text === "possible") return "Medium";
+  if (text) return "Low";
+  return "";
+}
+
+function relevanceBucketLabel(job) {
+  return normalizeRelevanceBucket(job.relevanceBucket || job.priority, job.relevanceScore) || "Low";
+}
+
 function relevanceScoreLabel(job) {
-  return Number.isFinite(Number(job.relevanceScore)) ? `${Number(job.relevanceScore)}/10` : `${job.priority} · ${job.score}`;
+  return Number.isFinite(Number(job.relevanceScore))
+    ? `${relevanceBucketLabel(job)} · ${Number(job.relevanceScore)}/10`
+    : `${normalizeRelevanceBucket(job.priority) || "Low"} · ${job.score}`;
 }
 
 function scoreRangeLabel(job) {
@@ -422,9 +513,20 @@ function scoreRangeLabel(job) {
 }
 
 function locationMatchesLabel(job) {
+  if (job.locationStatus === "conflict") {
+    const listing = job.listingLocation || job.location || "listing location";
+    const detail = job.detailLocation || "detail page location";
+    return `Location conflict: listing says ${listing}; detail says ${detail}`;
+  }
+  if (job.locationStatus === "mismatch") return "Location mismatch";
+  if (job.locationStatus === "unknown") return "Location unknown";
   if (job.locationMatchesProfile === "Yes") return "Location match: Yes";
   if (job.locationMatchesProfile === "No") return "Location match: No";
   return "";
+}
+
+function locationIsEligible(job) {
+  return job.locationStatus === "match" || (!job.locationStatus && job.locationMatchesProfile !== "No");
 }
 
 function browserTimeZone() {
@@ -456,17 +558,43 @@ function jobsByCompany() {
   return grouped;
 }
 
-function selectedCompanyJobs() {
+function selectedCompanyJobsBeforeRelevanceFilter() {
   const query = String(state.jobTitleSearch || "").trim().toLowerCase();
-  const direction = state.jobTitleSortDirection === "asc" ? 1 : -1;
-  const jobs = [...(jobsByCompany().get(state.selectedCompanyId) || [])]
+  return [...(jobsByCompany().get(state.selectedCompanyId) || [])]
     .filter((job) => !query || String(job.title || "").toLowerCase().includes(query));
+}
 
-  if (state.jobTitleSort === "date") {
-    return jobs.sort((a, b) => direction * (new Date(a.postedAt || 0) - new Date(b.postedAt || 0)) || (b.relevanceScore || 0) - (a.relevanceScore || 0));
+function selectedRelevanceBucketsForJobs(jobs) {
+  let selected = (state.jobRelevanceBuckets || [])
+    .filter((bucket) => relevanceBucketOrder.includes(bucket));
+
+  if (!selected.length || state.jobRelevanceAutoSelected) {
+    selected = ["High"];
   }
 
-  return jobs.sort((a, b) => direction * ((Number(a.relevanceScore || 0) - Number(b.relevanceScore || 0)) || (Number(a.score || 0) - Number(b.score || 0))) || new Date(b.postedAt || 0) - new Date(a.postedAt || 0));
+  if (jobs.length && !jobs.some((job) => selected.includes(relevanceBucketLabel(job)))) {
+    const fallbackBucket = relevanceBucketOrder.find((bucket) =>
+      jobs.some((job) => relevanceBucketLabel(job) === bucket)
+    );
+    selected = fallbackBucket ? [fallbackBucket] : selected;
+    state.jobRelevanceAutoSelected = true;
+  }
+
+  state.jobRelevanceBuckets = selected;
+  return selected;
+}
+
+function selectedCompanyJobs() {
+  const direction = state.jobTitleSortDirection === "asc" ? 1 : -1;
+  const jobs = selectedCompanyJobsBeforeRelevanceFilter();
+  const relevanceBuckets = selectedRelevanceBucketsForJobs(jobs);
+  const filteredJobs = jobs.filter((job) => relevanceBuckets.includes(relevanceBucketLabel(job)));
+
+  if (state.jobTitleSort === "date") {
+    return filteredJobs.sort((a, b) => direction * (new Date(a.postedAt || 0) - new Date(b.postedAt || 0)) || (b.relevanceScore || 0) - (a.relevanceScore || 0));
+  }
+
+  return filteredJobs.sort((a, b) => direction * ((Number(a.relevanceScore || 0) - Number(b.relevanceScore || 0)) || (Number(a.score || 0) - Number(b.score || 0))) || new Date(b.postedAt || 0) - new Date(a.postedAt || 0));
 }
 
 function nextSortDirection(sortKey) {
@@ -1076,6 +1204,8 @@ function renderCompanyJobResults() {
     button.addEventListener("click", () => {
       captureJobPaneScroll();
       state.selectedCompanyId = company.id;
+      state.jobRelevanceBuckets = ["High"];
+      state.jobRelevanceAutoSelected = true;
       state.selectedCompanyJobId = selectedCompanyJobs()[0]?.id || null;
       state.jobPaneScroll.titles = 0;
       state.jobPaneScroll.detail = 0;
@@ -1085,6 +1215,21 @@ function renderCompanyJobResults() {
   }
 
   const titlePane = document.createElement("section");
+  const bucketCounts = selectedCompanyJobsBeforeRelevanceFilter().reduce((counts, job) => {
+    const bucket = relevanceBucketLabel(job);
+    counts.set(bucket, (counts.get(bucket) || 0) + 1);
+    return counts;
+  }, new Map());
+  const relevanceFilterMarkup = relevanceBucketOrder.map((bucket) => {
+    const checked = state.jobRelevanceBuckets.includes(bucket) ? "checked" : "";
+    const active = checked ? " active" : "";
+    return `
+        <label class="job-relevance-option${active}">
+          <input type="checkbox" data-relevance-bucket="${bucket}" value="${bucket}" ${checked} />
+          <span>${bucket}</span>
+          <strong>${bucketCounts.get(bucket) || 0}</strong>
+        </label>`;
+  }).join("");
   titlePane.className = "folder-pane";
   titlePane.innerHTML = `
     <div class="folder-pane-heading">
@@ -1096,6 +1241,9 @@ function renderCompanyJobResults() {
     </div>
     <div class="job-title-search">
       <input type="search" placeholder="Search job titles" aria-label="Search job titles" />
+      <div class="job-relevance-filter" aria-label="Filter by relevance">
+        ${relevanceFilterMarkup}
+      </div>
     </div>
   `;
   for (const button of titlePane.querySelectorAll("[data-sort]")) {
@@ -1112,7 +1260,7 @@ function renderCompanyJobResults() {
       renderCompanyJobResults();
     });
   }
-  const searchInput = titlePane.querySelector(".job-title-search input");
+  const searchInput = titlePane.querySelector(".job-title-search input[type='search']");
   searchInput.value = state.jobTitleSearch || "";
   searchInput.addEventListener("input", () => {
     captureJobPaneScroll();
@@ -1121,13 +1269,27 @@ function renderCompanyJobResults() {
     state.jobPaneScroll.titles = 0;
     state.jobPaneScroll.detail = 0;
     renderCompanyJobResults();
-    const nextInput = els.companyJobTable.querySelector(".job-title-search input");
+    const nextInput = els.companyJobTable.querySelector(".job-title-search input[type='search']");
     if (nextInput) {
       nextInput.focus();
       const cursor = nextInput.value.length;
       nextInput.setSelectionRange(cursor, cursor);
     }
   });
+  for (const input of titlePane.querySelectorAll("[data-relevance-bucket]")) {
+    input.addEventListener("change", () => {
+      captureJobPaneScroll();
+      const checkedBuckets = [...titlePane.querySelectorAll("[data-relevance-bucket]:checked")]
+        .map((checkbox) => checkbox.value)
+        .filter((bucket) => relevanceBucketOrder.includes(bucket));
+      state.jobRelevanceBuckets = checkedBuckets.length ? checkedBuckets : [input.value];
+      state.jobRelevanceAutoSelected = false;
+      state.selectedCompanyJobId = selectedCompanyJobs()[0]?.id || null;
+      state.jobPaneScroll.titles = 0;
+      state.jobPaneScroll.detail = 0;
+      renderCompanyJobResults();
+    });
+  }
   if (!selectedJobs.length) {
     const empty = document.createElement("p");
     empty.className = "muted-note";
@@ -1188,6 +1350,7 @@ function renderSelectedJobDetail(job) {
         <strong></strong>
         <span></span>
       </div>
+      <p class="fit-location-row"></p>
       <div class="fit-grid">
         <div>
           <h5>Why it fits</h5>
@@ -1229,15 +1392,19 @@ function renderSelectedJobDetail(job) {
     markJobViewed(job.id);
   });
   const summaryLabel = job.summarySource === "llm" ? "LLM summary" : job.summarySource === "extracted" ? "Extracted summary" : "Summary";
-  wrapper.querySelector(".job-score-line").textContent = `${relevanceScoreLabel(job)} relevance · ${job.relevanceBucket || job.priority} · ${job.detailFetchedAt ? `${summaryLabel} fetched ${dateTimeLabel(job.detailFetchedAt)}` : "Summary fallback"}`;
+  wrapper.querySelector(".job-score-line").textContent = `${relevanceScoreLabel(job)} relevance · ${job.detailFetchedAt ? `${summaryLabel} fetched ${dateTimeLabel(job.detailFetchedAt)}` : "Summary fallback"}`;
   wrapper.querySelector(".job-detail-summary").textContent = job.description || "No summary available from this posting.";
 
-  wrapper.querySelector(".fit-score-row strong").textContent = relevanceScoreLabel(job);
+  wrapper.querySelector(".fit-score-row strong").textContent = relevanceBucketLabel(job);
   const rangeText = scoreRangeLabel(job);
   const locationText = locationMatchesLabel(job);
+  const scoreText = Number.isFinite(Number(job.relevanceScore)) ? `${Number(job.relevanceScore)}/10` : "";
   wrapper.querySelector(".fit-score-row span").textContent = manualRelevanceScoreFor(job) !== null
-    ? "Your saved score"
-    : [job.relevanceBucket, rangeText ? `range ${rangeText}` : "", job.confidence ? `${job.confidence} confidence` : "", locationText].filter(Boolean).join(" · ") || "Waiting for next LLM scan";
+    ? [scoreText, "Your saved score"].filter(Boolean).join(" · ")
+    : [scoreText, rangeText ? `range ${rangeText}` : "", job.confidence ? `${job.confidence} confidence` : ""].filter(Boolean).join(" · ") || "Waiting for next LLM scan";
+  const locationRow = wrapper.querySelector(".fit-location-row");
+  locationRow.textContent = locationText;
+  locationRow.className = `fit-location-row ${job.locationStatus || ""}`.trim();
   const reasonList = wrapper.querySelector(".fit-reasons");
   const concernList = wrapper.querySelector(".fit-concerns");
   const reasons = job.fitReasons?.length ? job.fitReasons : ["Run a fresh scan to generate personalized fit reasons for this role."];
@@ -1280,9 +1447,11 @@ function renderSelectedJobDetail(job) {
     statusButton.type = "button";
     statusButton.textContent = label;
     statusButton.className = statusFor(job) === nextStatus ? "active" : "";
-    if (nextStatus === "shortlisted" && job.locationMatchesProfile === "No") {
+    if (nextStatus === "shortlisted" && !locationIsEligible(job)) {
       statusButton.disabled = true;
-      statusButton.title = "This job does not match your profile location.";
+      statusButton.title = job.locationStatus === "conflict"
+        ? "This job has conflicting location signals, so it cannot be shortlisted yet."
+        : "This job does not match your profile location.";
     } else {
       statusButton.addEventListener("click", () => setJobStatus(job.id, nextStatus));
     }
@@ -1403,6 +1572,9 @@ function renderScannerRunCard(run, active = false, index = 0) {
   statSpans[3].textContent = `${totals.llmCalls || 0} LLM calls (${totals.llmSucceeded || 0} ok, ${totals.llmFailed || 0} failed, ${totals.llmCacheHits || 0} cached)`;
   statSpans[4].textContent = `${issueCount} failures · ${totals.pageFetches || 0} page fetches · ${totals.metaApiCalls || 0} API · ${totals.detailFetches || 0} details · ${totals.detailCacheHits || 0} cached details`;
 
+  const emailDigestSummary = renderScannerEmailDigest(run);
+  if (emailDigestSummary) body.querySelector(".scan-progress-panel").after(emailDigestSummary);
+
   const progress = scanProgressValues(run);
   body.querySelector('[data-progress-label="jobs"]').textContent = `${progress.rawJobs} raw jobs · ${progress.completedCompanies}/${progress.companyCount} companies`;
   body.querySelector('[data-progress-label="llm"]').textContent = `${progress.llmDone}/${progress.llmTarget} jobs personalized`;
@@ -1446,6 +1618,117 @@ function renderScannerRunCard(run, active = false, index = 0) {
     companyList.append(companyNode);
   }
 
+  card.append(body);
+  return card;
+}
+
+function renderFailedScannerRunCard(run) {
+  const card = document.createElement("details");
+  card.className = "scanner-run-card";
+  card.open = state.scannerOpenRunIds.has(`failure:${run.id}`);
+  card.addEventListener("toggle", () => {
+    const key = `failure:${run.id}`;
+    if (card.open) state.scannerOpenRunIds.add(key);
+    else state.scannerOpenRunIds.delete(key);
+  });
+
+  const totals = run.totals || {};
+  const issueCount = userRunIssueCount(run);
+  const failedCompanies = scannerFailureCompanies(run);
+  const summary = document.createElement("summary");
+  summary.className = "scanner-run-summary";
+  summary.innerHTML = `
+    <div>
+      <p class="eyebrow"></p>
+      <h3></h3>
+      <p></p>
+    </div>
+    <div class="scanner-summary-metrics">
+      <span></span>
+      <span></span>
+      <span></span>
+    </div>
+  `;
+  summary.querySelector(".eyebrow").textContent = `${run.userEmail || "Unknown user"} · ${run.scope || "scan"}`;
+  summary.querySelector("h3").textContent = dateTimeLabel(run.startedAt);
+  summary.querySelector("p").textContent = `${issueCount} issue${issueCount === 1 ? "" : "s"} across ${failedCompanies.length} compan${failedCompanies.length === 1 ? "y" : "ies"}`;
+  const summaryMetrics = summary.querySelectorAll(".scanner-summary-metrics span");
+  summaryMetrics[0].textContent = `${totals.jobsFound || 0} saved`;
+  summaryMetrics[1].textContent = `${totals.llmFailed || 0} LLM failed`;
+  summaryMetrics[2].textContent = scannerRunCacheLabel(run);
+  card.append(summary);
+
+  const body = document.createElement("div");
+  body.className = "scanner-run-body";
+  body.innerHTML = `
+    <div class="scanner-run-heading">
+      <div>
+        <p class="eyebrow"></p>
+        <h3></h3>
+        <p></p>
+      </div>
+      <span class="scanner-status"></span>
+    </div>
+    <div class="scanner-stat-strip">
+      <span></span>
+      <span></span>
+      <span></span>
+      <span></span>
+    </div>
+    <section class="scanner-failure-note">
+      <h4>Failure summary</h4>
+      <p></p>
+    </section>
+    <div class="scanner-company-list"></div>
+  `;
+  body.querySelector(".eyebrow").textContent = run.userEmail || "Unknown user";
+  body.querySelector("h3").textContent = `${statusText(run.scope)} scan`;
+  body.querySelector(".scanner-run-heading p:last-child").textContent = `${dateTimeLabel(run.startedAt)} to ${dateTimeLabel(run.finishedAt)}`;
+  body.querySelector(".scanner-status").textContent = statusText(run.status);
+  const statSpans = body.querySelectorAll(".scanner-stat-strip span");
+  statSpans[0].textContent = `${totals.companies || 0} companies`;
+  statSpans[1].textContent = `${totals.rawJobsFound || 0} raw jobs`;
+  statSpans[2].textContent = `${totals.jobsFound || 0} saved jobs`;
+  statSpans[3].textContent = `${issueCount} issues · ${scannerRunCacheLabel(run)}`;
+  body.querySelector(".scanner-failure-note p").textContent = failedCompanies.length
+    ? failedCompanies.map((company) => `${company.name}: ${(company.errors || []).slice(0, 2).join("; ") || statusText(company.status)}`).join(" · ")
+    : "No company-level failure details were captured.";
+
+  const emailDigestSummary = renderScannerEmailDigest(run);
+  if (emailDigestSummary) body.querySelector(".scanner-failure-note").after(emailDigestSummary);
+
+  const companyList = body.querySelector(".scanner-company-list");
+  for (const company of failedCompanies) {
+    const companyNode = document.createElement("article");
+    companyNode.className = "scanner-company-card has-error";
+    companyNode.innerHTML = `
+      <div class="scanner-company-top">
+        <div>
+          <h4></h4>
+          <p></p>
+        </div>
+        <span></span>
+      </div>
+      <div class="scanner-stat-strip small">
+        <span></span>
+        <span></span>
+        <span></span>
+      </div>
+      <pre class="scanner-log-view" aria-label="Failure log"></pre>
+    `;
+    companyNode.querySelector("h4").textContent = company.name;
+    companyNode.querySelector(".scanner-company-top p").textContent = company.extractor || company.careersUrl || "Scanner";
+    companyNode.querySelector(".scanner-company-top span").textContent = statusText(company.status);
+    const stats = companyNode.querySelectorAll(".scanner-stat-strip.small span");
+    stats[0].textContent = `${company.rawJobsFound || 0} raw`;
+    stats[1].textContent = `${company.jobsFound || 0} saved`;
+    stats[2].textContent = `${company.llmFailed || 0} LLM failed`;
+    const failedCalls = (company.calls || []).filter((call) => call.status === "error");
+    companyNode.querySelector(".scanner-log-view").textContent = failedCalls.length
+      ? failedCalls.map(scannerLogLine).join("\n")
+      : (company.errors || []).join("\n") || "No error log captured.";
+    companyList.append(companyNode);
+  }
   card.append(body);
   return card;
 }
@@ -1545,6 +1828,9 @@ function renderUserScannerRunCard(run, active = false, expanded = false) {
   body.querySelector('[data-progress-bar="jobs"]').style.width = `${progress.jobsPercent}%`;
   body.querySelector('[data-progress-bar="matching"]').style.width = `${progress.matchingPercent}%`;
 
+  const emailDigestSummary = renderScannerEmailDigest(run);
+  if (emailDigestSummary) body.querySelector(".scan-progress-panel").after(emailDigestSummary);
+
   const companyList = body.querySelector(".scanner-user-company-list");
   const visibleCompanies = active ? (run.companies || []) : scannerIssueCompanies(run);
   if (visibleCompanies.length) {
@@ -1570,14 +1856,44 @@ function renderUserScannerRunCard(run, active = false, expanded = false) {
   return card;
 }
 
+function renderScannerTabs(isAdmin) {
+  const visibleTabs = new Set(
+    Array.from(els.scannerTabButtons || [])
+      .filter((button) => isAdmin || button.dataset.adminOnly !== "true")
+      .map((button) => button.dataset.scannerTab)
+  );
+  if (!visibleTabs.has(state.scannerTab)) state.scannerTab = "activity";
+
+  els.scannerTabButtons.forEach((button) => {
+    const adminOnly = button.dataset.adminOnly === "true";
+    const visible = isAdmin || !adminOnly;
+    const active = button.dataset.scannerTab === state.scannerTab;
+    button.hidden = !visible;
+    button.setAttribute("aria-hidden", String(!visible));
+    button.classList.toggle("active", visible && active);
+    button.setAttribute("aria-selected", String(visible && active));
+  });
+
+  els.scannerTabPanels.forEach((panel) => {
+    const adminOnly = panel.dataset.adminOnly === "true";
+    const visible = isAdmin || !adminOnly;
+    const active = panel.dataset.scannerPanel === state.scannerTab;
+    panel.hidden = !visible || !active;
+    panel.setAttribute("aria-hidden", String(!visible || !active));
+    panel.classList.toggle("active", visible && active);
+  });
+}
+
 function renderScanner() {
   const runs = state.scanRuns || [];
+  const failedRuns = state.failedScanRuns || [];
   const localActive = localActiveScanRun();
   const activeRuns = state.activeScanRuns?.length ? state.activeScanRuns : localActive ? [localActive] : [];
   const latest = runs[0];
   const metricRun = activeRuns[0] || latest;
   const latestTotals = metricRun?.totals || {};
   const isAdmin = Boolean(state.currentUser?.isAdmin);
+  renderScannerTabs(isAdmin);
   els.scannerRunMetricLabel.textContent = "scan runs";
   els.scannerJobMetricLabel.textContent = isAdmin ? "jobs in latest run" : "jobs saved";
   els.scannerLlmMetricLabel.textContent = isAdmin ? "LLM calls" : "jobs matched";
@@ -1597,9 +1913,23 @@ function renderScanner() {
   }
   els.scannerCurrent.replaceChildren();
   els.scannerRunList.replaceChildren();
+  if (els.scannerFailureList) els.scannerFailureList.replaceChildren();
 
   for (const run of activeRuns) {
     els.scannerCurrent.append(isAdmin ? renderScannerRunCard(run, true) : renderUserScannerRunCard(run, true));
+  }
+
+  if (isAdmin && els.scannerFailureList) {
+    if (!failedRuns.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      empty.textContent = "No scanner failures found across users.";
+      els.scannerFailureList.append(empty);
+    } else {
+      for (const run of failedRuns) {
+        els.scannerFailureList.append(renderFailedScannerRunCard(run));
+      }
+    }
   }
 
   if (!runs.length) {
@@ -2043,6 +2373,7 @@ async function refreshScannerState() {
     const scanner = await api("/api/scanner");
     state.activeScanRuns = scanner.activeScanRuns || [];
     state.scanRuns = scanner.scanRuns || state.scanRuns || [];
+    state.failedScanRuns = scanner.failedScanRuns || state.failedScanRuns || [];
     if (state.activeScanRuns.length) state.activeScan = null;
     renderScanner();
   } catch {
@@ -2098,6 +2429,13 @@ els.companyTabButtons.forEach((button) => {
   button.addEventListener("click", () => {
     state.companiesTab = button.dataset.companyTab || "watchlist";
     render();
+  });
+});
+
+els.scannerTabButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    state.scannerTab = button.dataset.scannerTab || "activity";
+    renderScanner();
   });
 });
 

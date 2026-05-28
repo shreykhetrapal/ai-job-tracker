@@ -46,7 +46,7 @@ const jobMatchResponseFormat = {
         type: "integer",
         minimum: 0,
         maximum: 10,
-        description: "Personalized fit score from 0 to 10."
+        description: "Personalized role-fit score from 0 to 10, excluding location eligibility."
       },
       scoreRange: {
         type: "object",
@@ -69,7 +69,7 @@ const jobMatchResponseFormat = {
       },
       relevanceBucket: {
         type: "string",
-        enum: ["Excellent", "Strong", "Possible", "Weak", "Low"]
+        enum: ["High", "Medium", "Low"]
       },
       fitReasons: {
         type: "array",
@@ -1222,6 +1222,40 @@ function scanRunIssueCount(scanRun = {}) {
   return Math.max(Number(totals.errors || 0), companyIssues);
 }
 
+function scanRunFailureCompanies(scanRun = {}) {
+  return (scanRun.companies || []).filter((company) => {
+    const callFailures = (company.calls || []).some((call) => call.status === "error");
+    return company.status === "failed" || (company.errors || []).length || callFailures;
+  });
+}
+
+function scanRunHasFailure(scanRun = {}) {
+  return scanRun.status === "failed" || scanRunIssueCount(scanRun) > 0 || scanRunFailureCompanies(scanRun).length > 0;
+}
+
+function sanitizeEmailDigestScan(emailDigest = {}) {
+  return {
+    status: emailDigest.status || "",
+    recipient: emailDigest.recipient || "",
+    sentCount: Number(emailDigest.sentCount || 0),
+    checkedAt: emailDigest.checkedAt || "",
+    jobs: (emailDigest.jobs || []).map((job) => ({
+      id: job.id,
+      company: job.company,
+      title: job.title,
+      url: job.url,
+      location: job.location || "",
+      relevanceScore: job.relevanceScore ?? null,
+      roleRelevanceScore: job.roleRelevanceScore ?? job.relevanceScore ?? null,
+      relevanceBucket: normalizeRelevanceBucket(job.relevanceBucket, job.relevanceScore),
+      locationStatus: job.locationStatus || "",
+      listingLocation: job.listingLocation || job.location || "",
+      detailLocation: job.detailLocation || "",
+      postedAt: job.postedAt || ""
+    }))
+  };
+}
+
 function sanitizeScannerRun(scanRun = {}) {
   const totals = scanRun.totals || {};
   const matchedJobs =
@@ -1241,6 +1275,7 @@ function sanitizeScannerRun(scanRun = {}) {
       matchedJobs,
       errors: scanRunIssueCount(scanRun)
     },
+    ...(scanRun.emailDigest ? { emailDigest: sanitizeEmailDigestScan(scanRun.emailDigest) } : {}),
     companies: (scanRun.companies || []).map((company) => ({
       id: company.id,
       name: company.name,
@@ -1257,6 +1292,39 @@ function sanitizeScannerRuns(scanRuns = []) {
   return scanRuns.map(sanitizeScannerRun);
 }
 
+function listFailedScanRunsForAdmin() {
+  const rows = db.prepare(`
+    SELECT users.id AS user_id, users.email, user_stores.data
+    FROM user_stores
+    JOIN users ON users.id = user_stores.user_id
+    WHERE users.disabled = 0
+  `).all();
+  const failures = [];
+  for (const row of rows) {
+    let store;
+    try {
+      store = normalizeStore({ ...structuredClone(defaultStore), ...JSON.parse(row.data || "{}") });
+    } catch {
+      store = structuredClone(defaultStore);
+    }
+    for (const scanRun of store.scanRuns || []) {
+      if (!scanRunHasFailure(scanRun)) continue;
+      failures.push({
+        ...scanRun,
+        userId: row.user_id,
+        userEmail: row.email,
+        failureSummary: {
+          issueCount: scanRunIssueCount(scanRun),
+          failedCompanyCount: scanRunFailureCompanies(scanRun).length
+        }
+      });
+    }
+  }
+  return failures
+    .sort((a, b) => safeDate(b.startedAt) - safeDate(a.startedAt))
+    .slice(0, 80);
+}
+
 function getScannerState(user) {
   const store = readStore(user.id);
   const activeRuns = [...activeScanRuns.values()].filter((run) => run.userId === user.id);
@@ -1268,7 +1336,8 @@ function getScannerState(user) {
   }
   return {
     activeScanRuns: activeRuns,
-    scanRuns: store.scanRuns || []
+    scanRuns: store.scanRuns || [],
+    failedScanRuns: listFailedScanRunsForAdmin()
   };
 }
 
@@ -1377,7 +1446,7 @@ function jobDetailCacheKey(job) {
 
 function jobScoringInputHash(profile, jobFeedback, resumeText) {
   return stableHash(JSON.stringify({
-    scoringSchemaVersion: 3,
+    scoringSchemaVersion: 5,
     profile,
     resumeText,
     jobFeedback
@@ -1385,19 +1454,45 @@ function jobScoringInputHash(profile, jobFeedback, resumeText) {
 }
 
 function cachedSummaryResult(entry) {
+  const detailLocation = entry.detailLocation || detailLocationFromPostingContent(entry.postingContent || "");
   return {
     summary: entry.summary,
     source: entry.summarySource || "cache",
     relevanceScore: entry.relevanceScore,
+    roleRelevanceScore: entry.roleRelevanceScore ?? entry.relevanceScore,
     scoreRange: entry.scoreRange || null,
     confidence: entry.confidence || null,
     locationMatchesProfile: entry.locationMatchesProfile || null,
-    relevanceBucket: entry.relevanceBucket,
+    locationStatus: entry.locationStatus || "",
+    listingLocation: entry.listingLocation || entry.location || "",
+    detailLocation,
+    relevanceBucket: normalizeRelevanceBucket(entry.relevanceBucket, entry.relevanceScore),
     fitReasons: entry.fitReasons || [],
     concerns: entry.concerns || [],
     matchedSignals: entry.matchedSignals || [],
     cached: true
   };
+}
+
+function repairCandidateCentricSummaries(jobs = [], jobDetailCache = {}) {
+  const cacheEntries = Object.values(jobDetailCache || {});
+  return (jobs || []).map((job) => {
+    const cacheEntry = jobDetailCache[jobDetailCacheKey(job)] ||
+      cacheEntries.find((entry) => entry?.url && entry.url === job.url);
+    const backfilled = cacheEntry ? {
+      ...job,
+      roleRelevanceScore: job.roleRelevanceScore ?? cacheEntry.roleRelevanceScore ?? cacheEntry.relevanceScore,
+      listingLocation: job.listingLocation || cacheEntry.listingLocation || cacheEntry.location || job.location || "",
+      detailLocation: job.detailLocation || cacheEntry.detailLocation || detailLocationFromPostingContent(cacheEntry.postingContent || ""),
+      locationStatus: job.locationStatus || cacheEntry.locationStatus || ""
+    } : job;
+    if (!summaryMentionsCandidate(backfilled.description) || !cacheEntry?.postingContent) return backfilled;
+    return {
+      ...backfilled,
+      description: postingOnlySummaryFromContent(cacheEntry.postingContent, backfilled),
+      summarySource: "extracted"
+    };
+  });
 }
 
 function writeJobDetailCacheEntry(cache, key, job, postingContent, result, scoringInputHash) {
@@ -1416,10 +1511,14 @@ function writeJobDetailCacheEntry(cache, key, job, postingContent, result, scori
     summary: result.summary,
     summarySource: result.source,
     relevanceScore: result.relevanceScore,
+    roleRelevanceScore: result.roleRelevanceScore ?? result.relevanceScore,
     scoreRange: result.scoreRange || null,
     confidence: result.confidence || null,
     locationMatchesProfile: result.locationMatchesProfile || null,
-    relevanceBucket: result.relevanceBucket,
+    locationStatus: result.locationStatus || "",
+    listingLocation: result.listingLocation || job.listingLocation || job.location || "",
+    detailLocation: result.detailLocation || detailLocationFromPostingContent(postingContent),
+    relevanceBucket: normalizeRelevanceBucket(result.relevanceBucket, result.relevanceScore),
     fitReasons: result.fitReasons || [],
     concerns: result.concerns || [],
     matchedSignals: result.matchedSignals || [],
@@ -1467,34 +1566,139 @@ const desiredRoleStopWords = new Set([
   "manager", "specialist", "remote", "global", "strategy", "strategic"
 ]);
 
-function desiredRoleTokens(profile) {
-  return [...new Set((profile.desiredTitles || [])
-    .flatMap((title) => cleanProfileTerm(title).toLowerCase().split(/\s+/))
+const genericRoleWords = new Set([
+  "administrator", "advisor", "analyst", "architect", "associate", "consultant", "developer", "engineer",
+  "lead", "manager", "owner", "partner", "scientist", "specialist", "strategist"
+]);
+
+function normalizedRoleTokens(value) {
+  return cleanProfileTerm(value)
+    .toLowerCase()
+    .split(/\s+/)
     .map((token) => token.replace(/[^a-z0-9+#.]/g, ""))
-    .filter((token) => token.length > 2 && !desiredRoleStopWords.has(token)))];
+    .filter((token) => token.length > 2 && !desiredRoleStopWords.has(token));
+}
+
+function desiredRoleSpecs(profile) {
+  return (profile.desiredTitles || [])
+    .map((title) => {
+      const tokens = normalizedRoleTokens(title);
+      return {
+        raw: cleanProfileTerm(title).toLowerCase(),
+        tokens,
+        domainTokens: tokens.filter((token) => !genericRoleWords.has(token)),
+        roleTokens: tokens.filter((token) => genericRoleWords.has(token))
+      };
+    })
+    .filter((spec) => spec.tokens.length);
 }
 
 function titleMatchesDesiredRole(title, profile) {
-  const tokens = desiredRoleTokens(profile);
-  if (!tokens.length) return true;
+  const specs = desiredRoleSpecs(profile);
+  if (!specs.length) return true;
   const normalizedTitle = cleanProfileTerm(title).toLowerCase();
-  return tokens.some((token) => normalizedTitle.includes(token));
+  const titleTokens = new Set(normalizedRoleTokens(title));
+  return specs.some((spec) => {
+    if (spec.raw && normalizedTitle.includes(spec.raw)) return true;
+    if (spec.domainTokens.length) {
+      return spec.domainTokens.every((token) => titleTokens.has(token)) &&
+        (!spec.roleTokens.length || spec.roleTokens.some((token) => titleTokens.has(token)));
+    }
+    return spec.tokens.every((token) => titleTokens.has(token));
+  });
+}
+
+function roleFamilyMatchesPosting(job, profile, postingContent = "") {
+  if (titleMatchesDesiredRole(job.title, profile)) return true;
+  const specs = desiredRoleSpecs(profile);
+  if (!specs.length) return true;
+  const titleTokens = new Set(normalizedRoleTokens(job.title));
+  const posting = `${job.title || ""} ${postingContent || ""}`.toLowerCase();
+  return specs.some((spec) => {
+    if (!spec.domainTokens.length) return false;
+    const hasRoleToken = !spec.roleTokens.length || spec.roleTokens.some((token) => titleTokens.has(token));
+    const hasDomainEvidence = spec.domainTokens.every((token) => posting.includes(token));
+    return hasRoleToken && hasDomainEvidence;
+  });
+}
+
+function relevanceCapForRoleFamily(job, profile, postingContent = "") {
+  if (roleFamilyMatchesPosting(job, profile, postingContent)) return 10;
+  return desiredRoleSpecs(profile).some((spec) => spec.domainTokens.length) ? 4 : 6;
 }
 
 function hasProfileLocationFilter(profile) {
   return normalizeList(profile?.locations).length > 0;
 }
 
-function jobLocationMatchesProfile(job, profile) {
-  if (!hasProfileLocationFilter(profile)) return true;
-  if (normalizeYesNo(job.locationMatchesProfile) === "No") return false;
-  if (normalizeYesNo(job.locationMatchesProfile) === "Yes") return true;
+function compactLocationText(value) {
+  return cleanText(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
 
-  const haystack = `${job.location || ""} ${job.description || ""} ${(job.tags || []).join(" ")}`.toLowerCase();
-  return normalizeList(profile.locations).some((rawLocation) => {
-    const location = cleanProfileTerm(rawLocation).toLowerCase();
-    return location && haystack.includes(location);
-  });
+function profileLocationAliases(value) {
+  const normalized = compactLocationText(cleanProfileTerm(value));
+  if (!normalized) return [];
+  const aliases = new Set([normalized]);
+  if (normalized.includes("remote")) aliases.add("remote");
+  if (["united states", "united states of america", "usa", "us"].includes(normalized)) {
+    aliases.add("united states");
+    aliases.add("united states of america");
+    aliases.add("usa");
+    aliases.add("us");
+  }
+  return [...aliases];
+}
+
+function locationTextIncludesAlias(locationText, alias) {
+  const normalized = compactLocationText(locationText);
+  const compactAlias = compactLocationText(alias);
+  if (!normalized || !compactAlias) return false;
+  if (compactAlias.length <= 3) {
+    return new RegExp(`(^|\\s)${compactAlias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`).test(normalized);
+  }
+  return normalized.includes(compactAlias);
+}
+
+function locationTextMatchesProfile(locationText, profile) {
+  if (!cleanText(locationText)) return null;
+  return normalizeList(profile.locations).some((rawLocation) =>
+    profileLocationAliases(rawLocation).some((alias) => locationTextIncludesAlias(locationText, alias))
+  );
+}
+
+function resolveJobLocationStatus(job, profile, detailLocationOverride = null) {
+  const listingLocation = cleanText(job.listingLocation || job.location || "");
+  const detailLocation = cleanText(detailLocationOverride ?? job.detailLocation ?? "");
+  if (!hasProfileLocationFilter(profile)) {
+    return { status: "match", matchesProfile: true, listingLocation, detailLocation };
+  }
+
+  const listingMatch = listingLocation ? locationTextMatchesProfile(listingLocation, profile) : null;
+  const detailMatch = detailLocation ? locationTextMatchesProfile(detailLocation, profile) : null;
+  let status = "unknown";
+  if (listingMatch !== null && detailMatch !== null && listingMatch !== detailMatch) {
+    status = "conflict";
+  } else if (listingMatch !== null) {
+    status = listingMatch ? "match" : "mismatch";
+  } else if (detailMatch !== null) {
+    status = detailMatch ? "match" : "mismatch";
+  }
+
+  return {
+    status,
+    matchesProfile: status === "match",
+    listingLocation,
+    detailLocation
+  };
+}
+
+function jobLocationMatchesProfile(job, profile) {
+  return resolveJobLocationStatus(job, profile).matchesProfile;
 }
 
 function tokensForJob(job) {
@@ -1503,6 +1707,11 @@ function tokensForJob(job) {
     .replace(/[^a-z0-9+#.]+/g, " ")
     .split(/\s+/)
     .filter((token) => token.length > 2 && !feedbackStopWords.has(token));
+}
+
+function roleFamilyEvidenceText(job) {
+  if (job.postingContent) return job.postingContent;
+  return summaryMentionsCandidate(job.description) ? "" : (job.description || "");
 }
 
 function feedbackWeightFromManualScore(score) {
@@ -1572,15 +1781,6 @@ function heuristicRelevanceScore(job, profile) {
   else if (skillHits >= 2) score = Math.max(score, 7);
   else if (skillHits >= 1) score = Math.max(score, 5);
 
-  for (const rawLocation of profile.locations || []) {
-    const location = cleanProfileTerm(rawLocation).toLowerCase();
-    if (!location) continue;
-    if (job.location.toLowerCase().includes(location) || haystack.includes(location)) {
-      score = Math.min(10, score + 1);
-      break;
-    }
-  }
-
   return Math.max(0, Math.min(10, score));
 }
 
@@ -1592,14 +1792,11 @@ function scoreJob(job, profile, feedbackSignals = { weights: new Map(), exact: n
 
   const manualRelevance = feedbackSignals.manualScores?.get(job.id);
   const heuristicRelevance = heuristicRelevanceScore(job, profile);
-  const llmRelevance = clampRelevanceScore(job.relevanceScore);
-  const titleAligned = titleMatchesDesiredRole(job.title, profile);
-  const guardedLlmRelevance = titleAligned ? llmRelevance : Math.min(llmRelevance ?? 0, 4);
-  const guardedHeuristicRelevance = titleAligned ? heuristicRelevance : Math.min(heuristicRelevance, 4);
+  const llmRelevance = clampRelevanceScore(job.roleRelevanceScore ?? job.relevanceScore);
+  const relevanceCap = relevanceCapForRoleFamily(job, profile, roleFamilyEvidenceText(job));
+  const guardedLlmRelevance = llmRelevance === null ? null : Math.min(llmRelevance, relevanceCap);
+  const guardedHeuristicRelevance = Math.min(heuristicRelevance, relevanceCap);
   const effectiveRelevance = manualRelevance ?? Math.max(guardedLlmRelevance ?? 0, guardedHeuristicRelevance);
-  if (!jobLocationMatchesProfile(job, profile)) {
-    return Math.min(20, Math.round(feedbackScore(job, feedbackSignals)));
-  }
   if (effectiveRelevance > 0) {
     return Math.round(effectiveRelevance * 10 + feedbackScore(job, feedbackSignals));
   }
@@ -1628,7 +1825,7 @@ function scoreJob(job, profile, feedbackSignals = { weights: new Map(), exact: n
   }
   if (profile.seniority && haystack.includes(profile.seniority.toLowerCase())) contextScore += 8;
 
-  const profileScore = roleSkillScore < 7 || (profile.locations.length && locationScore === 0)
+  const profileScore = roleSkillScore < 7
     ? 0
     : roleSkillScore + locationScore + contextScore;
   return Math.round(profileScore + feedbackScore(job, feedbackSignals));
@@ -1641,25 +1838,27 @@ function annotateJobs(jobs, profile, jobFeedback = {}, historicalJobs = jobs) {
       const score = scoreJob(job, profile, signals);
       const relevance = jobFeedback?.[job.id]?.relevance || null;
       const manualRelevanceScore = clampRelevanceScore(jobFeedback?.[job.id]?.manualRelevanceScore);
-      const titleAligned = titleMatchesDesiredRole(job.title, profile);
-      const llmRelevanceScore = clampRelevanceScore(job.relevanceScore);
-      const locationAligned = jobLocationMatchesProfile(job, profile);
-      const guardedLlmRelevanceScore = titleAligned ? llmRelevanceScore : Math.min(llmRelevanceScore ?? 0, 4);
+      const relevanceCap = relevanceCapForRoleFamily(job, profile, roleFamilyEvidenceText(job));
+      const llmRelevanceScore = clampRelevanceScore(job.roleRelevanceScore ?? job.relevanceScore);
+      const location = resolveJobLocationStatus(job, profile);
+      const guardedLlmRelevanceScore = llmRelevanceScore === null ? null : Math.min(llmRelevanceScore, relevanceCap);
       const heuristicRelevanceScoreValue = heuristicRelevanceScore(job, profile);
-      const guardedHeuristicRelevanceScore = titleAligned ? heuristicRelevanceScoreValue : Math.min(heuristicRelevanceScoreValue, 4);
-      const effectiveRelevanceScore = locationAligned
-        ? manualRelevanceScore ?? Math.max(guardedLlmRelevanceScore ?? 0, guardedHeuristicRelevanceScore)
-        : Math.min(manualRelevanceScore ?? guardedLlmRelevanceScore ?? guardedHeuristicRelevanceScore, 2);
+      const guardedHeuristicRelevanceScore = Math.min(heuristicRelevanceScoreValue, relevanceCap);
+      const effectiveRelevanceScore = manualRelevanceScore ?? Math.max(guardedLlmRelevanceScore ?? 0, guardedHeuristicRelevanceScore);
       return {
         ...job,
         url: normalizeJobOpenUrl(job),
         relevance,
         manualRelevanceScore,
         score,
+        roleRelevanceScore: effectiveRelevanceScore,
         relevanceScore: effectiveRelevanceScore,
-        locationMatchesProfile: hasProfileLocationFilter(profile) ? (locationAligned ? "Yes" : "No") : "Yes",
-        relevanceBucket: locationAligned ? (job.relevanceBucket || relevanceBucketFromScore(effectiveRelevanceScore)) : "Low",
-        priority: !locationAligned ? "Low" : score >= 80 ? "Excellent" : score >= 65 ? "Strong" : score >= 45 ? "Possible" : score >= 25 ? "Weak" : "Low"
+        locationMatchesProfile: hasProfileLocationFilter(profile) ? (location.matchesProfile ? "Yes" : "No") : "Yes",
+        locationStatus: location.status,
+        listingLocation: location.listingLocation,
+        detailLocation: location.detailLocation,
+        relevanceBucket: relevanceBucketFromScore(effectiveRelevanceScore),
+        priority: relevanceBucketFromScore(effectiveRelevanceScore)
       };
     })
     .sort((a, b) => b.score - a.score || (b.relevanceScore || 0) - (a.relevanceScore || 0) || safeDate(b.postedAt) - safeDate(a.postedAt));
@@ -1849,6 +2048,7 @@ function readableJsonValue(value) {
   if (typeof value === "object") {
     if (value.address) return readableJsonValue(value.address);
     return [value.name, value.addressLocality, value.addressRegion, value.addressCountry]
+      .map(readableJsonValue)
       .filter(Boolean)
       .join(", ");
   }
@@ -2035,10 +2235,19 @@ function normalizeYesNo(value) {
 }
 
 function relevanceBucketFromScore(score) {
-  if (score >= 9) return "Excellent";
-  if (score >= 7) return "Strong";
-  if (score >= 5) return "Possible";
-  if (score >= 3) return "Weak";
+  const normalized = clampRelevanceScore(score);
+  if (normalized === null) return "Low";
+  if (normalized >= 8) return "High";
+  if (normalized >= 5) return "Medium";
+  return "Low";
+}
+
+function normalizeRelevanceBucket(value, score = null) {
+  const scoreBucket = clampRelevanceScore(score);
+  if (scoreBucket !== null) return relevanceBucketFromScore(scoreBucket);
+  const text = cleanText(value).toLowerCase();
+  if (text === "high" || text === "excellent" || text === "strong") return "High";
+  if (text === "medium" || text === "possible") return "Medium";
   return "Low";
 }
 
@@ -2062,9 +2271,72 @@ function feedbackMemory(jobFeedback = {}, historicalJobs = []) {
   };
 }
 
+const postingSummarySectionLabels = [
+  "Title",
+  "Team",
+  "Location",
+  "Employment type",
+  "Weekly hours",
+  "Summary",
+  "Responsibilities",
+  "Description",
+  "Minimum qualifications",
+  "Preferred qualifications",
+  "Qualifications",
+  "Pay & Benefits"
+];
+
+function postingSection(content, labels) {
+  const text = String(content || "");
+  const labelPattern = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const nextLabelPattern = postingSummarySectionLabels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const match = text.match(new RegExp(`(?:^|\\n|\\s)(?:${labelPattern})\\s*:\\s*([\\s\\S]*?)(?=\\s*(?:${nextLabelPattern})\\s*:|$)`, "i"));
+  return cleanText(match?.[1] || "");
+}
+
+function detailLocationFromPostingContent(postingContent) {
+  return postingSection(postingContent, ["Location"]).replace(/\[object Object\]/gi, "").replace(/\s*,\s*$/, "").trim();
+}
+
+function concisePostingText(value, maxParts = 2) {
+  const text = cleanText(value)
+    .replace(/\bApple is where individual imaginations[\s\S]*?add something\./i, "")
+    .replace(/\bImagine what you could do here\.[\s\S]*?accomplish\./i, "")
+    .trim();
+  const parts = text
+    .split(/\s+-\s+|(?<=[.!?])\s+/)
+    .map(cleanText)
+    .filter((part) => part.length > 35 && !/equal opportunity|benefits|reasonable accommodations/i.test(part))
+    .slice(0, maxParts);
+  return parts.join(" ");
+}
+
+function postingOnlySummaryFromContent(postingContent, job) {
+  const responsibilityText = postingSection(postingContent, ["Responsibilities", "Description"]);
+  const summaryText = postingSection(postingContent, ["Summary"]);
+  const qualificationText = postingSection(postingContent, ["Minimum qualifications", "Preferred qualifications", "Qualifications"]);
+  const core = concisePostingText(responsibilityText || summaryText || postingContent, 2);
+  const qualifications = concisePostingText(qualificationText, 1);
+  const summary = [core, qualifications ? `Key requirements include ${qualifications}` : ""].filter(Boolean).join(" ");
+  return cleanText(summary).slice(0, 900) || cleanText(`${job.title}. ${job.description || ""}`).slice(0, 900);
+}
+
+function summaryMentionsCandidate(summary) {
+  return /\b(candidate|profile|resume|target title|target role|fit for|matches the candidate|does not match|diverges from|data\/analytics-oriented)\b/i.test(summary);
+}
+
 async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null) {
+  const detailLocation = detailLocationFromPostingContent(postingContent);
+  const location = resolveJobLocationStatus(job, profile, detailLocation);
   if (!OPENAI_API_KEY || !postingContent) {
-    return { summary: postingContent, source: "extracted" };
+    return {
+      summary: postingContent,
+      source: "extracted",
+      locationMatchesProfile: location.matchesProfile ? "Yes" : "No",
+      locationStatus: location.status,
+      listingLocation: location.listingLocation,
+      detailLocation
+    };
   }
 
   const memory = feedbackMemory(jobFeedback, historicalJobs);
@@ -2087,7 +2359,7 @@ async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, 
           verbosity: "low",
           format: jobMatchResponseFormat
         },
-        instructions: "You are a job-application matching assistant. Use only the supplied posting, candidate profile, resume text, and feedback examples. Return strict JSON only. Do not invent requirements or experience.",
+        instructions: "You are a job-application matching assistant. Use only the supplied posting, candidate profile, resume text, and feedback examples. Return strict JSON only. Do not invent requirements or experience. The summary field must summarize only the job posting, not the candidate.",
         input: [
           {
             role: "user",
@@ -2096,7 +2368,8 @@ async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, 
                 type: "input_text",
                 text: `Company: ${job.company}
 Title: ${job.title}
-Location: ${job.location}
+Listing location: ${location.listingLocation || job.location || "not listed"}
+Detail page location: ${location.detailLocation || "not found"}
 
 Candidate profile:
 Target titles: ${(profile.desiredTitles || []).join(", ")}
@@ -2119,20 +2392,21 @@ ${postingContent}
 
 Return strict JSON with this exact shape:
 {
-  "summary": "2-3 concise sentences about the job responsibilities, domain, and requirements.",
+  "summary": "2-3 concise sentences about only the job responsibilities, domain, and requirements. Do not mention the candidate, profile, resume, fit, match, or missing skills.",
   "relevanceScore": 7,
   "scoreRange": { "low": 6, "high": 8 },
   "confidence": "High|Medium|Low",
   "locationMatchesProfile": "Yes|No",
-  "relevanceBucket": "Excellent|Strong|Possible|Weak|Low",
+  "relevanceBucket": "High|Medium|Low",
   "fitReasons": ["why this matches the candidate"],
   "concerns": ["why this may not match"],
   "matchedSignals": ["specific title/skill/domain/location signals"]
 }
-Score relevanceScore from 0 to 10 based on fit for this candidate's target titles: ${(profile.desiredTitles || []).join(", ") || "not specified"}.
+Score relevanceScore from 0 to 10 based on role fit for this candidate's target titles: ${(profile.desiredTitles || []).join(", ") || "not specified"}.
+Do not reduce relevanceScore because of location; location is evaluated separately.
 Use scoreRange as a confidence interval around the score. Keep it narrow only when the posting text, resume, and profile provide clear matching evidence.
-Set locationMatchesProfile to Yes if the job location matches one of the candidate profile locations. Set it to No if the candidate supplied profile locations and the job location does not match any of them. If the candidate profile has no locations, set locationMatchesProfile to Yes and ignore location as a filter.
-Use 8-10 only when the job title or core responsibilities closely match the target titles and domain. If the job is mainly a different function, such as software engineering for a finance profile, cap the score at 4 even when it mentions transferable skills like SQL, analytics, or Excel. Use feedback examples to learn preferences.`
+Set locationMatchesProfile using the listing location above as the primary source. Treat the detail page location as secondary when it conflicts with the listing location. If the candidate profile has no locations, set locationMatchesProfile to Yes and ignore location as a filter.
+Use High only for scores 8-10, Medium for scores 5-7, and Low for scores 0-4. Use 8-10 only when the job title or core responsibilities closely match both the target role family and domain. Generic role words alone, such as Engineer, Analyst, Manager, or Specialist, are not enough. If the job is mainly a different function or domain, cap the score at 4 even when it mentions transferable skills like Python, SQL, analytics, statistics, Excel, or scripting. Use feedback examples to learn preferences.`
               }
             ]
           }
@@ -2178,12 +2452,21 @@ Use 8-10 only when the job title or core responsibilities closely match the targ
   }
   const text = responseText(data);
   const parsed = extractJsonObject(text);
-  const summary = cleanText(parsed?.summary || text).slice(0, 900);
-  const relevanceScore = clampRelevanceScore(parsed?.relevanceScore);
-  const scoreRange = clampScoreRange(parsed?.scoreRange, relevanceScore);
+  const parsedSummary = cleanText(parsed?.summary || text).slice(0, 900);
+  const fallbackSummary = postingOnlySummaryFromContent(postingContent, job);
+  const summary = summaryMentionsCandidate(parsedSummary) ? fallbackSummary : (parsedSummary || fallbackSummary);
+  const rawRelevanceScore = clampRelevanceScore(parsed?.relevanceScore);
+  const relevanceCap = relevanceCapForRoleFamily(job, profile, postingContent);
+  const relevanceScore = rawRelevanceScore === null ? null : Math.min(rawRelevanceScore, relevanceCap);
+  const scoreRange = clampScoreRange(parsed?.scoreRange
+    ? {
+      low: Math.min(clampRelevanceScore(parsed.scoreRange.low) ?? relevanceScore ?? 0, relevanceCap),
+      high: Math.min(clampRelevanceScore(parsed.scoreRange.high) ?? relevanceScore ?? 0, relevanceCap)
+    }
+    : parsed?.scoreRange, relevanceScore);
   const confidence = normalizeConfidence(parsed?.confidence) || "Medium";
-  const locationMatchesProfile = normalizeList(profile.locations).length ? (normalizeYesNo(parsed?.locationMatchesProfile) || "No") : "Yes";
-  const relevanceBucket = parsed?.relevanceBucket || (relevanceScore !== null ? relevanceBucketFromScore(relevanceScore) : null);
+  const locationMatchesProfile = hasProfileLocationFilter(profile) ? (location.matchesProfile ? "Yes" : "No") : "Yes";
+  const relevanceBucket = normalizeRelevanceBucket(parsed?.relevanceBucket, relevanceScore);
   const fitReasons = Array.isArray(parsed?.fitReasons) ? parsed.fitReasons.map(cleanText).filter(Boolean).slice(0, 5) : [];
   const concerns = Array.isArray(parsed?.concerns) ? parsed.concerns.map(cleanText).filter(Boolean).slice(0, 5) : [];
   const matchedSignals = Array.isArray(parsed?.matchedSignals) ? parsed.matchedSignals.map(cleanText).filter(Boolean).slice(0, 8) : [];
@@ -2198,9 +2481,13 @@ Use 8-10 only when the job title or core responsibilities closely match the targ
     summary: summary || postingContent,
     source: summary ? "llm" : "extracted",
     relevanceScore,
+    roleRelevanceScore: relevanceScore,
     scoreRange,
     confidence,
     locationMatchesProfile,
+    locationStatus: location.status,
+    listingLocation: location.listingLocation,
+    detailLocation,
     relevanceBucket,
     fitReasons,
     concerns,
@@ -2385,9 +2672,13 @@ async function enrichJobSummaries(jobs, profile, jobFeedback = {}, historicalJob
           description: result.summary,
           summarySource: result.cached ? "cache" : result.source,
           relevanceScore: result.relevanceScore,
+          roleRelevanceScore: result.roleRelevanceScore ?? result.relevanceScore,
           scoreRange: result.scoreRange || null,
           confidence: result.confidence || null,
           locationMatchesProfile: result.locationMatchesProfile || null,
+          locationStatus: result.locationStatus || "",
+          listingLocation: result.listingLocation || job.location || "",
+          detailLocation: result.detailLocation || "",
           relevanceBucket: result.relevanceBucket,
           fitReasons: result.fitReasons || [],
           concerns: result.concerns || [],
@@ -3423,7 +3714,10 @@ function eightfoldPositionDate(position) {
 function eightfoldPositionToJob(position, company) {
   const url = position.canonicalPositionUrl ||
     (position.id ? new URL(`/careers/job/${encodeURIComponent(position.id)}`, company.careersUrl).toString() : company.careersUrl);
-  const locations = Array.isArray(position.locations) ? position.locations : [position.location].filter(Boolean);
+  const locations = (Array.isArray(position.locations) ? position.locations : [position.location])
+    .map(readableJsonValue)
+    .map(cleanText)
+    .filter(Boolean);
   const tags = [
     "Company watchlist",
     position.department,
@@ -3438,6 +3732,7 @@ function eightfoldPositionToJob(position, company) {
     title: cleanText(position.posting_name || position.name),
     company: company.name,
     location: cleanText(locations.join(", ") || "Netflix careers"),
+    listingLocation: cleanText(locations.join(", ") || "Netflix careers"),
     url,
     postedAt: dateFromUnixSeconds(position.t_update || position.t_create),
     tags,
@@ -3989,10 +4284,25 @@ function digestCandidateJobs(jobs, store, sentKeys) {
   return (jobs || [])
     .filter((job) => !sentKeys.has(jobDetailCacheKey(job)))
     .filter((job) => (clampRelevanceScore(job.relevanceScore) ?? 0) >= minScore)
-    .filter((job) => job.locationMatchesProfile !== "No")
+    .filter((job) => job.locationMatchesProfile !== "No" && (!job.locationStatus || job.locationStatus === "match"))
     .filter((job) => !["applied", "rejected"].includes(store.statuses?.[job.id]?.status))
     .sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0) || (b.score || 0) - (a.score || 0) || safeDate(b.postedAt) - safeDate(a.postedAt))
     .slice(0, Number.isFinite(maxJobs) ? Math.max(1, Math.min(50, Math.round(maxJobs))) : 10);
+}
+
+function digestJobPreview(job) {
+  return {
+    id: job.id,
+    company: job.company || "",
+    title: job.title || "",
+    url: job.url || "",
+    location: job.location || "",
+    relevanceScore: clampRelevanceScore(job.relevanceScore),
+    roleRelevanceScore: clampRelevanceScore(job.roleRelevanceScore ?? job.relevanceScore),
+    relevanceBucket: normalizeRelevanceBucket(job.relevanceBucket, job.relevanceScore),
+    locationStatus: job.locationStatus || "",
+    postedAt: job.postedAt || ""
+  };
 }
 
 function renderDigestEmail(user, jobs, settings) {
@@ -4010,8 +4320,9 @@ function renderDigestEmail(user, jobs, settings) {
     htmlSections.push(`<h2 style="font-size:18px;margin:24px 0 8px;">${escapeHtml(company)}</h2>`);
     for (const job of companyJobs) {
       const reasons = (job.fitReasons || []).slice(0, 2).join("; ");
+      const bucket = normalizeRelevanceBucket(job.relevanceBucket, job.relevanceScore);
       textLines.push(`- ${job.title} (${job.location || "Location not listed"})`);
-      textLines.push(`  Relevance: ${job.relevanceScore || "?"}/10 · ${job.relevanceBucket || ""}`);
+      textLines.push(`  Relevance: ${bucket} · ${job.relevanceScore || "?"}/10`);
       if (job.description) textLines.push(`  ${cleanText(job.description).slice(0, 260)}`);
       if (reasons) textLines.push(`  Why: ${reasons}`);
       textLines.push(`  ${job.url}`);
@@ -4019,7 +4330,7 @@ function renderDigestEmail(user, jobs, settings) {
       htmlSections.push(`
         <article style="border:1px solid #d6dbe1;border-radius:8px;padding:14px;margin:10px 0;">
           <h3 style="margin:0 0 6px;font-size:16px;">${escapeHtml(job.title)}</h3>
-          <p style="margin:0 0 8px;color:#475467;">${escapeHtml(job.location || "Location not listed")} · Relevance ${escapeHtml(job.relevanceScore || "?")}/10 · ${escapeHtml(job.relevanceBucket || "")}</p>
+          <p style="margin:0 0 8px;color:#475467;">${escapeHtml(job.location || "Location not listed")} · Relevance ${escapeHtml(bucket)} · ${escapeHtml(job.relevanceScore || "?")}/10</p>
           <p style="margin:0 0 8px;color:#202124;line-height:1.45;">${escapeHtml(cleanText(job.description || "").slice(0, 420))}</p>
           ${reasons ? `<p style="margin:0 0 10px;color:#344054;"><strong>Why it fits:</strong> ${escapeHtml(reasons)}</p>` : ""}
           <a href="${escapeHtml(job.url)}" style="display:inline-block;background:#0f766e;color:#fff;text-decoration:none;border-radius:6px;padding:8px 12px;">Open job</a>
@@ -4093,7 +4404,8 @@ function resumeRecommendations(profile, resumeText, jobs) {
 
 function getState(user) {
   const store = readStore(user.id);
-  const companyScanJobs = annotateJobs(store.companyScanJobs || [], store.profile, store.jobFeedback || {});
+  const repairedJobs = repairCandidateCentricSummaries(store.companyScanJobs || [], store.jobDetailCache || {});
+  const companyScanJobs = annotateJobs(repairedJobs, store.profile, store.jobFeedback || {});
   const {
     jobDetailCache,
     lastGoodCompanyScanJobs,
@@ -4106,6 +4418,7 @@ function getState(user) {
   return {
     ...publicStore,
     scanRuns: publicScanRuns,
+    failedScanRuns: user.isAdmin ? listFailedScanRunsForAdmin() : [],
     emailDigest: normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email),
     emailDigestStatus: emailDigestStatus(store),
     currentUser: user,
@@ -4282,6 +4595,13 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
 
   const candidates = digestCandidateJobs(digestScanJobs, store, sentJobKeys(user.id));
   if (!candidates.length) {
+    result.scanRun.emailDigest = {
+      status: "no_matches",
+      recipient: settings.email,
+      sentCount: 0,
+      checkedAt: new Date().toISOString(),
+      jobs: []
+    };
     store.emailDigest.lastDigestSentAt = new Date().toISOString();
     store.emailDigest.lastDigestStatus = "No new relevant jobs found.";
     writeStore(user.id, store);
@@ -4292,6 +4612,14 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
   const message = renderDigestEmail(user, candidates, settings);
   await sendEmail({ to: settings.email, ...message });
   recordEmailDigestSends(user.id, digestId, candidates);
+  result.scanRun.emailDigest = {
+    status: "sent",
+    recipient: settings.email,
+    sentCount: candidates.length,
+    checkedAt: new Date().toISOString(),
+    digestId,
+    jobs: candidates.map(digestJobPreview)
+  };
   store.emailDigest.lastDigestSentAt = new Date().toISOString();
   store.emailDigest.lastDigestStatus = `Sent ${candidates.length} job${candidates.length === 1 ? "" : "s"} to ${settings.email}.`;
   writeStore(user.id, store);
@@ -4691,8 +5019,13 @@ const server = http.createServer(async (req, res) => {
       const nextStatus = body.status || "new";
       if (nextStatus === "shortlisted") {
         const job = (store.companyScanJobs || store.jobs || []).find((item) => item.id === id);
-        if (job && !jobLocationMatchesProfile(job, store.profile || {})) {
-          sendJson(res, 400, { error: "This job does not match your profile location, so it cannot be shortlisted." });
+        const location = job ? resolveJobLocationStatus(job, store.profile || {}) : null;
+        if (job && !location.matchesProfile) {
+          sendJson(res, 400, {
+            error: location.status === "conflict"
+              ? "This job has conflicting location signals, so it cannot be shortlisted yet."
+              : "This job does not match your profile location, so it cannot be shortlisted."
+          });
           return;
         }
       }
