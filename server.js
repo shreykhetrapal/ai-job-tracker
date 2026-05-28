@@ -28,7 +28,7 @@ const OPENAI_SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || "gpt-5-nano";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
-const EMAIL_DIGEST_MAX_SHOWN = 10;
+const DEFAULT_EMAIL_DIGEST_MAX_JOBS = 10;
 const DASHBOARD_URL = process.env.PUBLIC_APP_URL || process.env.APP_URL || "https://ai-job-tracker.com/#jobs";
 const emailPattern = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 
@@ -1242,7 +1242,7 @@ function sanitizeEmailDigestScan(emailDigest = {}) {
     sentCount: Number(emailDigest.sentCount || 0),
     newMatchesFound: Number(emailDigest.newMatchesFound || emailDigest.totalEligibleCount || 0),
     totalEligibleCount: Number(emailDigest.totalEligibleCount || emailDigest.newMatchesFound || 0),
-    maxShown: Number(emailDigest.maxShown || EMAIL_DIGEST_MAX_SHOWN),
+    maxShown: Number(emailDigest.maxShown || DEFAULT_EMAIL_DIGEST_MAX_JOBS),
     cachedDetailHits: Number(emailDigest.cachedDetailHits || 0),
     cachedLlmHits: Number(emailDigest.cachedLlmHits || 0),
     llmCalls: Number(emailDigest.llmCalls || 0),
@@ -4285,6 +4285,11 @@ function shouldRunEmailDigest(settings) {
   return Boolean(nowParts && nowParts.minutes >= targetMinutes);
 }
 
+function emailDigestMaxJobs(settings = {}) {
+  const maxJobs = Number(settings.maxJobs ?? DEFAULT_EMAIL_DIGEST_MAX_JOBS);
+  return Number.isFinite(maxJobs) ? Math.max(1, Math.min(50, Math.round(maxJobs))) : DEFAULT_EMAIL_DIGEST_MAX_JOBS;
+}
+
 function digestEligibleJobs(jobs, store, sentKeys) {
   const settings = store.emailDigest || {};
   const minScore = clampRelevanceScore(settings.minRelevanceScore) ?? 7;
@@ -4297,7 +4302,7 @@ function digestEligibleJobs(jobs, store, sentKeys) {
 }
 
 function digestCandidateJobs(jobs, store, sentKeys) {
-  return digestEligibleJobs(jobs, store, sentKeys).slice(0, EMAIL_DIGEST_MAX_SHOWN);
+  return digestEligibleJobs(jobs, store, sentKeys).slice(0, emailDigestMaxJobs(store.emailDigest || {}));
 }
 
 function digestJobPreview(job) {
@@ -4317,13 +4322,14 @@ function digestJobPreview(job) {
 
 function emailDigestScanSummary(scanRun, settings, candidates, eligibleCount, status, digestId = "") {
   const totals = scanRun?.totals || {};
+  const maxShown = emailDigestMaxJobs(settings);
   return {
     status,
     recipient: settings.email,
     sentCount: candidates.length,
     newMatchesFound: Number(eligibleCount || 0),
     totalEligibleCount: Number(eligibleCount || 0),
-    maxShown: EMAIL_DIGEST_MAX_SHOWN,
+    maxShown,
     cachedDetailHits: Number(totals.detailCacheHits || 0),
     cachedLlmHits: Number(totals.llmCacheHits || 0),
     llmCalls: Number(totals.llmCalls || 0),
@@ -4629,7 +4635,7 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
   addScanRun(store, result.scanRun);
 
   const eligibleCandidates = digestEligibleJobs(digestScanJobs, store, sentJobKeys(user.id));
-  const candidates = eligibleCandidates.slice(0, EMAIL_DIGEST_MAX_SHOWN);
+  const candidates = eligibleCandidates.slice(0, emailDigestMaxJobs(settings));
   if (!candidates.length) {
     result.scanRun.emailDigest = emailDigestScanSummary(result.scanRun, settings, [], eligibleCandidates.length, "no_matches");
     store.emailDigest.lastDigestSentAt = new Date().toISOString();
