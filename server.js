@@ -799,13 +799,24 @@ async function seedCompanyCatalog() {
   for (const company of defaultCompanyCatalog) {
     await upsertCompanyCatalog(company, { scanner: company.scanner || "" });
   }
-  const rows = await dbAll("SELECT data FROM user_stores");
+  const rows = await dbAll(`
+    SELECT jsonb_array_elements(COALESCE(data->'targetCompanies', '[]'::jsonb)) AS company
+    FROM user_stores
+  `);
   for (const row of rows) {
-    const store = parseStoreRow(row);
-    for (const company of store.targetCompanies || []) {
-      if (!company?.careersUrl) continue;
-      await upsertCompanyCatalog(company, { scanner: company.scanner || "" });
-    }
+    const company = row?.company || {};
+    const careersUrl = normalizeUrl(company.careersUrl || company.careers_url || "");
+    const name = String(company.name || "").trim();
+    if (!careersUrl || !name) continue;
+    await upsertCompanyCatalog({
+      id: company.id || makeId(name || careersUrl),
+      name,
+      careersUrl,
+      notes: String(company.notes || "").trim(),
+      scanner: String(company.scanner || "").trim()
+    }, {
+      scanner: String(company.scanner || "").trim()
+    });
   }
   await dedupeCompanyCatalog();
 }
