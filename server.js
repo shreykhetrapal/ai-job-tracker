@@ -17,10 +17,12 @@ const HOST = process.env.HOST || "127.0.0.1";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.DATABASE_SSL || "require";
 const DATABASE_POOL_MAX = Number(process.env.DATABASE_POOL_MAX || 8);
-const DATABASE_CONNECT_TIMEOUT_MS = Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 10000);
+const DATABASE_CONNECT_TIMEOUT_MS = Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 60000);
 const DATABASE_IDLE_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_TIMEOUT_MS || 30000);
 const DATABASE_QUERY_TIMEOUT_MS = Number(process.env.DATABASE_QUERY_TIMEOUT_MS || 15000);
 const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS || 15000);
+const DATABASE_STARTUP_RETRIES = Number(process.env.DATABASE_STARTUP_RETRIES || 5);
+const DATABASE_STARTUP_RETRY_DELAY_MS = Number(process.env.DATABASE_STARTUP_RETRY_DELAY_MS || 5000);
 const BACKGROUND_JOBS_FIRST_RUN_DELAY_MS = Number(process.env.BACKGROUND_JOBS_FIRST_RUN_DELAY_MS || 180000);
 const BACKGROUND_JOBS_INTERVAL_MS = Number(process.env.BACKGROUND_JOBS_INTERVAL_MS || (60 * 60 * 1000));
 const DATA_DIR = path.join(__dirname, "data");
@@ -267,6 +269,10 @@ db.on("error", (error) => {
   console.error("Database pool error:", error.message);
 });
 
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function toPostgresSql(sql) {
   let index = 0;
   return String(sql).replace(/\?/g, () => `$${++index}`);
@@ -291,7 +297,26 @@ async function dbExec(sql) {
 }
 
 async function initializeDatabase() {
-  await dbExec(await readFile(path.join(MIGRATIONS_DIR, "001_initial_supabase.sql"), "utf8"));
+  const migrationSql = await readFile(path.join(MIGRATIONS_DIR, "001_initial_supabase.sql"), "utf8");
+  const attempts = Number.isFinite(DATABASE_STARTUP_RETRIES) && DATABASE_STARTUP_RETRIES > 0
+    ? Math.floor(DATABASE_STARTUP_RETRIES)
+    : 5;
+  const retryDelayMs = Number.isFinite(DATABASE_STARTUP_RETRY_DELAY_MS) && DATABASE_STARTUP_RETRY_DELAY_MS > 0
+    ? DATABASE_STARTUP_RETRY_DELAY_MS
+    : 5000;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await dbExec(migrationSql);
+      return;
+    } catch (error) {
+      if (attempt >= attempts) {
+        throw new Error(`Failed to connect to database after ${attempts} attempts: ${error.message}`);
+      }
+      console.warn(`Database startup check failed (${attempt}/${attempts}): ${error.message}. Retrying in ${retryDelayMs}ms.`);
+      await wait(retryDelayMs);
+    }
+  }
 }
 
 await initializeDatabase();
