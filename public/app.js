@@ -34,7 +34,13 @@ const state = {
   scannerOpenRunIds: new Set(),
   scannerTab: "activity",
   activeScan: null,
-  sidebarCollapsed: localStorage.getItem("jobTrackerSidebarCollapsed") === "true"
+  sidebarCollapsed: localStorage.getItem("jobTrackerSidebarCollapsed") === "true",
+  bootLoading: true,
+  bootStatusText: "Connecting to workspace...",
+  bootError: "",
+  apiInflightCount: 0,
+  foregroundInflightCount: 0,
+  showTopProgress: false
 };
 
 if (window.location.protocol === "file:") {
@@ -42,6 +48,15 @@ if (window.location.protocol === "file:") {
 }
 
 const apiBase = "";
+const loadingTiming = {
+  showDelayMs: 250,
+  minVisibleMs: 350
+};
+let topProgressShowTimer = null;
+let topProgressHideTimer = null;
+let topProgressVisibleAt = 0;
+let bootStatusTimer = null;
+let bootStartedAt = 0;
 
 const els = {
   appShell: document.querySelector("#appShell"),
@@ -51,7 +66,12 @@ const els = {
   viewEyebrow: document.querySelector("#viewEyebrow"),
   viewTitle: document.querySelector("#viewTitle"),
   viewMeta: document.querySelector("#viewMeta"),
+  topbarProgress: document.querySelector("#topbarProgress"),
   topbarUserBadge: document.querySelector("#topbarUserBadge"),
+  appBootBanner: document.querySelector("#appBootOverlay"),
+  appBootStatus: document.querySelector("#appBootStatus"),
+  appBootError: document.querySelector("#appBootError"),
+  appBootRetry: document.querySelector("#appBootRetry"),
   scanNow: document.querySelector("#scanNow"),
   lastScrape: document.querySelector("#lastScrape"),
   checkLlm: document.querySelector("#checkLlm"),
@@ -190,29 +210,131 @@ function viewFromHash() {
   return viewTitles[view] ? view : "overview";
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(`${apiBase}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...options
-  });
-  const raw = await response.text();
-  let data = {};
-  if (raw) {
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      const isHtml = /^\s*</.test(raw);
-      throw new Error(isHtml
-        ? "The app returned a web page instead of data. Refresh the page, sign in again, and make sure the app server was restarted."
-        : "The app returned a response I could not read.");
+function bootStatusFromElapsed(elapsedMs) {
+  if (elapsedMs > 5000) return "Still loading - this can take a little longer on large accounts.";
+  if (elapsedMs > 2500) return "Preparing job board and scanner history...";
+  if (elapsedMs > 1200) return "Loading your profile and companies...";
+  return "Connecting to workspace...";
+}
+
+function startBootStatusTicker() {
+  stopBootStatusTicker();
+  bootStartedAt = Date.now();
+  state.bootStatusText = bootStatusFromElapsed(0);
+  bootStatusTimer = setInterval(() => {
+    if (!state.bootLoading || state.bootError) return;
+    const next = bootStatusFromElapsed(Date.now() - bootStartedAt);
+    if (next === state.bootStatusText) return;
+    state.bootStatusText = next;
+    renderLoadingUi();
+  }, 250);
+}
+
+function stopBootStatusTicker() {
+  if (bootStatusTimer) clearInterval(bootStatusTimer);
+  bootStatusTimer = null;
+}
+
+function syncTopProgressVisibility() {
+  if (state.foregroundInflightCount > 0) {
+    if (topProgressHideTimer) {
+      clearTimeout(topProgressHideTimer);
+      topProgressHideTimer = null;
     }
+    if (state.showTopProgress || topProgressShowTimer) return;
+    topProgressShowTimer = setTimeout(() => {
+      topProgressShowTimer = null;
+      if (state.foregroundInflightCount < 1) return;
+      state.showTopProgress = true;
+      topProgressVisibleAt = Date.now();
+      renderLoadingUi();
+    }, loadingTiming.showDelayMs);
+    return;
   }
-  if (response.status === 401) {
-    window.location.href = "/login.html";
-    throw new Error("Sign in required.");
+
+  if (topProgressShowTimer) {
+    clearTimeout(topProgressShowTimer);
+    topProgressShowTimer = null;
   }
-  if (!response.ok) throw new Error(data.error || "Request failed");
-  return data;
+  if (!state.showTopProgress) return;
+
+  const elapsed = Date.now() - topProgressVisibleAt;
+  const delay = Math.max(0, loadingTiming.minVisibleMs - elapsed);
+  if (topProgressHideTimer) clearTimeout(topProgressHideTimer);
+  topProgressHideTimer = setTimeout(() => {
+    topProgressHideTimer = null;
+    if (state.foregroundInflightCount > 0) return;
+    state.showTopProgress = false;
+    renderLoadingUi();
+  }, delay);
+}
+
+function beginApiRequest(loadingMode) {
+  state.apiInflightCount += 1;
+  if (loadingMode === "foreground") {
+    state.foregroundInflightCount += 1;
+    syncTopProgressVisibility();
+  }
+}
+
+function endApiRequest(loadingMode) {
+  state.apiInflightCount = Math.max(0, state.apiInflightCount - 1);
+  if (loadingMode === "foreground") {
+    state.foregroundInflightCount = Math.max(0, state.foregroundInflightCount - 1);
+    syncTopProgressVisibility();
+  }
+}
+
+function renderLoadingUi() {
+  const busy = state.bootLoading ? "true" : "false";
+  els.appShell.setAttribute("aria-busy", busy);
+
+  const showTopProgress = Boolean(state.showTopProgress);
+  if (els.topbarProgress) {
+    els.topbarProgress.hidden = !showTopProgress;
+    els.topbarProgress.classList.toggle("visible", showTopProgress);
+  }
+
+  if (!els.appBootBanner) return;
+  const showBanner = Boolean(state.bootLoading);
+  els.appBootBanner.hidden = !showBanner;
+  els.appBootBanner.classList.toggle("visible", showBanner);
+  els.appBootStatus.textContent = state.bootStatusText || "Loading dashboard...";
+  const hasError = Boolean(state.bootError);
+  els.appBootError.hidden = !hasError;
+  els.appBootError.textContent = state.bootError || "";
+  els.appBootRetry.hidden = !hasError;
+}
+
+async function api(path, options = {}) {
+  const { loading = "foreground", ...requestOptions } = options;
+  beginApiRequest(loading);
+  try {
+    const response = await fetch(`${apiBase}${path}`, {
+      headers: { "Content-Type": "application/json" },
+      ...requestOptions
+    });
+    const raw = await response.text();
+    let data = {};
+    if (raw) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        const isHtml = /^\s*</.test(raw);
+        throw new Error(isHtml
+          ? "The app returned a web page instead of data. Refresh the page, sign in again, and make sure the app server was restarted."
+          : "The app returned a response I could not read.");
+      }
+    }
+    if (response.status === 401) {
+      window.location.href = "/login.html";
+      throw new Error("Sign in required.");
+    }
+    if (!response.ok) throw new Error(data.error || "Request failed");
+    return data;
+  } finally {
+    endApiRequest(loading);
+  }
 }
 
 function updateState(next) {
@@ -2215,6 +2337,7 @@ function render() {
   renderPipeline();
   renderEmailDigest();
   renderFeedback();
+  renderLoadingUi();
 }
 
 function clearCompanyRequestForm() {
@@ -2438,7 +2561,7 @@ async function scanCompany(id, button) {
 
 async function refreshScannerState() {
   try {
-    const scanner = await api("/api/scanner");
+    const scanner = await api("/api/scanner", { loading: "background" });
     state.activeScanRuns = scanner.activeScanRuns || [];
     state.scanRuns = scanner.scanRuns || state.scanRuns || [];
     state.failedScanRuns = scanner.failedScanRuns || state.failedScanRuns || [];
@@ -2681,9 +2804,37 @@ els.checkLlm.addEventListener("click", async () => {
   }
 });
 
+async function loadInitialDashboardState() {
+  state.bootLoading = true;
+  state.bootError = "";
+  state.bootStatusText = "Connecting to workspace...";
+  startBootStatusTicker();
+  renderLoadingUi();
+  try {
+    updateState(await api("/api/state", { loading: "background" }));
+    stopBootStatusTicker();
+    state.bootLoading = false;
+    state.bootError = "";
+    renderLoadingUi();
+    refreshScannerState();
+  } catch (error) {
+    stopBootStatusTicker();
+    state.bootLoading = true;
+    state.bootStatusText = "Unable to load dashboard data.";
+    state.bootError = error.message || "Unable to load dashboard data.";
+    renderLoadingUi();
+  }
+}
+
+els.appBootRetry.addEventListener("click", async () => {
+  els.appBootRetry.disabled = true;
+  await loadInitialDashboardState();
+  els.appBootRetry.disabled = false;
+});
+
 state.view = viewFromHash();
-updateState(await api("/api/state"));
-await refreshScannerState();
+render();
+await loadInitialDashboardState();
 
 setInterval(() => {
   if (shouldPollScanner()) refreshScannerState();

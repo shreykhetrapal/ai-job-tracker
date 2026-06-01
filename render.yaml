@@ -25,6 +25,10 @@ services:
         value: "15000"
       - key: DATABASE_STATEMENT_TIMEOUT_MS
         value: "15000"
+      - key: BACKGROUND_JOBS_FIRST_RUN_DELAY_MS
+        value: "180000"
+      - key: BACKGROUND_JOBS_INTERVAL_MS
+        value: "3600000"
       - key: PUBLIC_APP_URL
         sync: false
       - key: OPENAI_API_KEY

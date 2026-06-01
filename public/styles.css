@@ -97,6 +97,39 @@ a.ghost-button:hover {
   grid-template-columns: 280px minmax(0, 1fr);
 }
 
+.app-shell[aria-busy="true"] {
+  cursor: progress;
+}
+
+.app-boot-status,
+.app-boot-error {
+  margin: 0;
+  color: #43516b;
+  line-height: 1.4;
+}
+
+.app-boot-error {
+  color: #b42318;
+}
+
+.topbar-progress {
+  position: relative;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e8f0fd;
+}
+
+.topbar-progress span {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 40%;
+  min-width: 84px;
+  background: linear-gradient(90deg, rgba(96, 165, 250, 0) 0%, #60a5fa 38%, #2563eb 62%, rgba(96, 165, 250, 0) 100%);
+  animation: loadingSweep 1.2s linear infinite;
+}
+
 .sidebar {
   min-height: 100vh;
   padding: 28px 22px;
@@ -227,6 +260,7 @@ nav {
   gap: 18px;
   align-items: flex-start;
   margin-bottom: 20px;
+  position: relative;
 }
 
 .toolbar {
@@ -2291,6 +2325,77 @@ label span {
   backdrop-filter: blur(16px);
 }
 
+.topbar-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 3px;
+  border-radius: 0;
+  background: rgba(148, 184, 244, 0.36);
+}
+
+.topbar-progress[hidden] {
+  display: none;
+}
+
+.topbar-progress.visible {
+  display: block;
+}
+
+.topbar-progress span {
+  width: 22%;
+  min-width: 64px;
+}
+
+.app-boot-banner {
+  position: absolute;
+  left: 28px;
+  right: 28px;
+  bottom: -42px;
+  min-height: 34px;
+  border: 1px solid #cfe0f5;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 9px;
+}
+
+.app-boot-banner[hidden] {
+  display: none;
+}
+
+.app-boot-banner-copy {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.app-boot-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 5px rgba(37, 99, 235, 0.12);
+  flex: 0 0 auto;
+}
+
+.app-boot-banner .app-boot-status,
+.app-boot-banner .app-boot-error {
+  font-size: 12px;
+}
+
+.app-boot-banner .primary-button {
+  min-height: 28px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 .topbar h2 {
   color: #111827;
   font-size: 25px;
@@ -2338,6 +2443,23 @@ label span {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes loadingSweep {
+  from {
+    transform: translateX(-140%);
+  }
+  to {
+    transform: translateX(400%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .topbar-progress span {
+    animation: none;
+    width: 100%;
+    transform: translateX(0);
   }
 }
 

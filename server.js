@@ -21,6 +21,8 @@ const DATABASE_CONNECT_TIMEOUT_MS = Number(process.env.DATABASE_CONNECT_TIMEOUT_
 const DATABASE_IDLE_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_TIMEOUT_MS || 30000);
 const DATABASE_QUERY_TIMEOUT_MS = Number(process.env.DATABASE_QUERY_TIMEOUT_MS || 15000);
 const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS || 15000);
+const BACKGROUND_JOBS_FIRST_RUN_DELAY_MS = Number(process.env.BACKGROUND_JOBS_FIRST_RUN_DELAY_MS || 180000);
+const BACKGROUND_JOBS_INTERVAL_MS = Number(process.env.BACKGROUND_JOBS_INTERVAL_MS || (60 * 60 * 1000));
 const DATA_DIR = path.join(__dirname, "data");
 const STORE_PATH = path.join(DATA_DIR, "store.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -226,6 +228,7 @@ const defaultCompanyCatalog = [
 ];
 
 const activeScanRuns = new Map();
+let backgroundMaintenanceRunning = false;
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -575,14 +578,59 @@ async function recordEmailDigestSends(userId, digestId, jobs) {
 
 async function listUsers() {
   const users = await dbAll("SELECT id, email, is_admin, disabled, created_at FROM users ORDER BY created_at ASC");
-  return Promise.all(users.map(async (user) => ({
-    ...publicUser(user),
-    usage: {
-      today: await dailyUsage(user.id),
-      total: await totalUsage(user.id)
-    },
-    stats: await userStoreStats(user.id)
-  })));
+  const userIds = users.map((user) => user.id);
+  if (!userIds.length) return [];
+
+  const usageRows = await dbAll(`
+    SELECT
+      user_id,
+      COALESCE(SUM(CASE WHEN type = 'scan' AND created_at >= ? THEN count ELSE 0 END), 0) AS today_scans,
+      COALESCE(SUM(CASE WHEN type = 'llm' AND created_at >= ? THEN count ELSE 0 END), 0) AS today_llm_calls,
+      COALESCE(SUM(CASE WHEN type = 'scan' THEN count ELSE 0 END), 0) AS total_scans,
+      COALESCE(SUM(CASE WHEN type = 'llm' THEN count ELSE 0 END), 0) AS total_llm_calls
+    FROM usage_events
+    WHERE user_id = ANY(?::text[])
+    GROUP BY user_id
+  `, [todayIsoStart(), todayIsoStart(), userIds]);
+  const usageByUser = new Map(usageRows.map((row) => [row.user_id, row]));
+
+  const statsRows = await dbAll(`
+    SELECT
+      user_id,
+      jsonb_array_length(COALESCE(data->'targetCompanies', '[]'::jsonb)) AS companies,
+      jsonb_array_length(COALESCE(data->'companyScanJobs', '[]'::jsonb)) AS jobs,
+      jsonb_array_length(COALESCE(data->'scanRuns', '[]'::jsonb)) AS scan_runs,
+      data->>'lastScrapeAt' AS last_scrape_at
+    FROM user_stores
+    WHERE user_id = ANY(?::text[])
+  `, [userIds]);
+  const statsByUser = new Map(statsRows.map((row) => [row.user_id, row]));
+
+  return users.map((user) => {
+    const usage = usageByUser.get(user.id) || {};
+    const stats = statsByUser.get(user.id) || {};
+    return {
+      ...publicUser(user),
+      usage: {
+        today: {
+          scans: Number(usage.today_scans || 0),
+          llmCalls: Number(usage.today_llm_calls || 0),
+          scanLimit: DAILY_SCAN_LIMIT,
+          llmLimit: DAILY_LLM_LIMIT
+        },
+        total: {
+          scans: Number(usage.total_scans || 0),
+          llmCalls: Number(usage.total_llm_calls || 0)
+        }
+      },
+      stats: {
+        companies: Number(stats.companies || 0),
+        jobs: Number(stats.jobs || 0),
+        scanRuns: Number(stats.scan_runs || 0),
+        lastScrapeAt: stats.last_scrape_at || null
+      }
+    };
+  });
 }
 
 async function deleteUser(userId, actorId) {
@@ -819,25 +867,6 @@ async function seedCompanyCatalog() {
   for (const company of defaultCompanyCatalog) {
     await upsertCompanyCatalog(company, { scanner: company.scanner || "" });
   }
-  const rows = await dbAll(`
-    SELECT jsonb_array_elements(COALESCE(data->'targetCompanies', '[]'::jsonb)) AS company
-    FROM user_stores
-  `);
-  for (const row of rows) {
-    const company = row?.company || {};
-    const careersUrl = normalizeUrl(company.careersUrl || company.careers_url || "");
-    const name = String(company.name || "").trim();
-    if (!careersUrl || !name) continue;
-    await upsertCompanyCatalog({
-      id: company.id || makeId(name || careersUrl),
-      name,
-      careersUrl,
-      notes: String(company.notes || "").trim(),
-      scanner: String(company.scanner || "").trim()
-    }, {
-      scanner: String(company.scanner || "").trim()
-    });
-  }
   await dedupeCompanyCatalog();
 }
 
@@ -967,12 +996,20 @@ async function totalUsage(userId) {
 }
 
 async function userStoreStats(userId) {
-  const store = await readStore(userId);
+  const row = await dbGet(`
+    SELECT
+      jsonb_array_length(COALESCE(data->'targetCompanies', '[]'::jsonb)) AS companies,
+      jsonb_array_length(COALESCE(data->'companyScanJobs', '[]'::jsonb)) AS jobs,
+      jsonb_array_length(COALESCE(data->'scanRuns', '[]'::jsonb)) AS scan_runs,
+      data->>'lastScrapeAt' AS last_scrape_at
+    FROM user_stores
+    WHERE user_id = ?
+  `, [userId]);
   return {
-    companies: store.targetCompanies?.length || 0,
-    jobs: store.companyScanJobs?.length || 0,
-    scanRuns: store.scanRuns?.length || 0,
-    lastScrapeAt: store.lastScrapeAt || null
+    companies: Number(row?.companies || 0),
+    jobs: Number(row?.jobs || 0),
+    scanRuns: Number(row?.scan_runs || 0),
+    lastScrapeAt: row?.last_scrape_at || null
   };
 }
 
@@ -1058,6 +1095,13 @@ function emailDigestStatus(store) {
     issues,
     lastDigestSentAt: settings.lastDigestSentAt || null,
     lastDigestStatus: settings.lastDigestStatus || "Not sent yet."
+  };
+}
+
+function emailDigestState(user, store) {
+  return {
+    emailDigest: normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email),
+    emailDigestStatus: emailDigestStatus(store)
   };
 }
 
@@ -1218,6 +1262,38 @@ function scanRunHasFailure(scanRun = {}) {
   return scanRun.status === "failed" || scanRunIssueCount(scanRun) > 0 || scanRunFailureCompanies(scanRun).length > 0;
 }
 
+function compactFailedScanRunForAdmin(scanRun = {}, row = {}) {
+  const failedCompanies = scanRunFailureCompanies(scanRun).map((company) => ({
+    id: company.id,
+    name: company.name,
+    status: company.status,
+    extractor: company.extractor || "",
+    startedAt: company.startedAt || null,
+    finishedAt: company.finishedAt || null,
+    rawJobsFound: Number(company.rawJobsFound || 0),
+    jobsFound: Number(company.jobsFound || 0),
+    llmFailed: Number(company.llmFailed || 0),
+    errors: (company.errors || []).slice(0, 6),
+    calls: (company.calls || []).filter((call) => call.status === "error").slice(-12)
+  }));
+  return {
+    id: scanRun.id,
+    scope: scanRun.scope,
+    status: scanRun.status,
+    startedAt: scanRun.startedAt,
+    finishedAt: scanRun.finishedAt,
+    totals: scanRun.totals || {},
+    emailDigest: scanRun.emailDigest ? sanitizeEmailDigestScan(scanRun.emailDigest) : null,
+    companies: failedCompanies,
+    userId: row.user_id,
+    userEmail: row.email,
+    failureSummary: {
+      issueCount: scanRunIssueCount(scanRun),
+      failedCompanyCount: failedCompanies.length
+    }
+  };
+}
+
 function sanitizeEmailDigestScan(emailDigest = {}) {
   return {
     status: emailDigest.status || "",
@@ -1285,36 +1361,49 @@ function sanitizeScannerRuns(scanRuns = []) {
 
 async function listFailedScanRunsForAdmin() {
   const rows = await dbAll(`
-    SELECT users.id AS user_id, users.email, user_stores.data
+    SELECT
+      users.id AS user_id,
+      users.email,
+      runs.scan_run->>'id' AS id,
+      runs.scan_run->>'scope' AS scope,
+      runs.scan_run->>'status' AS status,
+      runs.scan_run->>'startedAt' AS started_at,
+      runs.scan_run->>'finishedAt' AS finished_at,
+      COALESCE(runs.scan_run->'totals', '{}'::jsonb) AS totals,
+      runs.scan_run->'emailDigest' AS email_digest,
+      0 AS failed_company_count
     FROM user_stores
     JOIN users ON users.id = user_stores.user_id
+    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(user_stores.data->'scanRuns', '[]'::jsonb)) AS runs(scan_run)
     WHERE users.disabled = 0
+      AND (
+        runs.scan_run->>'status' = 'failed'
+        OR COALESCE((runs.scan_run->'totals'->>'errors')::int, 0) > 0
+      )
+    ORDER BY runs.scan_run->>'startedAt' DESC
+    LIMIT 80
   `);
-  const failures = [];
-  for (const row of rows) {
-    let store;
-    try {
-      const data = typeof row.data === "string" ? JSON.parse(row.data || "{}") : (row.data || {});
-      store = normalizeStore({ ...structuredClone(defaultStore), ...data });
-    } catch {
-      store = structuredClone(defaultStore);
-    }
-    for (const scanRun of store.scanRuns || []) {
-      if (!scanRunHasFailure(scanRun)) continue;
-      failures.push({
-        ...scanRun,
-        userId: row.user_id,
-        userEmail: row.email,
-        failureSummary: {
-          issueCount: scanRunIssueCount(scanRun),
-          failedCompanyCount: scanRunFailureCompanies(scanRun).length
-        }
-      });
-    }
-  }
-  return failures
-    .sort((a, b) => safeDate(b.startedAt) - safeDate(a.startedAt))
-    .slice(0, 80);
+  return rows.map((row) => {
+    const totals = typeof row.totals === "string" ? parseJsonField(row.totals) || {} : row.totals || {};
+    const emailDigest = typeof row.email_digest === "string" ? parseJsonField(row.email_digest) : row.email_digest;
+    const failedCompanyCount = Number(row.failed_company_count || 0);
+    return {
+      id: row.id,
+      scope: row.scope,
+      status: row.status,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      totals,
+      emailDigest: emailDigest ? sanitizeEmailDigestScan(emailDigest) : null,
+      companies: [],
+      userId: row.user_id,
+      userEmail: row.email,
+      failureSummary: {
+        issueCount: Math.max(Number(totals.errors || 0), failedCompanyCount),
+        failedCompanyCount
+      }
+    };
+  });
 }
 
 async function getScannerState(user) {
@@ -4538,7 +4627,7 @@ async function getState(user) {
   return {
     ...publicStore,
     scanRuns: publicScanRuns,
-    failedScanRuns: user.isAdmin ? await listFailedScanRunsForAdmin() : [],
+    failedScanRuns: [],
     emailDigest: normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email),
     emailDigestStatus: emailDigestStatus(store),
     currentUser: user,
@@ -4794,6 +4883,23 @@ async function maybeDailyEmailDigests() {
   }
 }
 
+async function runBackgroundMaintenance() {
+  if (backgroundMaintenanceRunning) return;
+  backgroundMaintenanceRunning = true;
+  try {
+    await maybeDailyScrape();
+  } catch (error) {
+    console.error("Daily scrape failed:", error.message);
+  }
+  try {
+    await maybeDailyEmailDigests();
+  } catch (error) {
+    console.error("Email digest check failed:", error.message);
+  } finally {
+    backgroundMaintenanceRunning = false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -4968,13 +5074,13 @@ const server = http.createServer(async (req, res) => {
       const body = await parseBody(req);
       store.emailDigest = normalizeEmailDigest(body, store.emailDigest || {}, user.email);
       await writeStore(user.id, store);
-      sendJson(res, 200, await getState(user));
+      sendJson(res, 200, emailDigestState(user, store));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/email-digest/test") {
       await runEmailDigestForUser(user, { test: true });
-      sendJson(res, 200, await getState(user));
+      sendJson(res, 200, emailDigestState(user, await readStore(user.id)));
       return;
     }
 
@@ -5197,8 +5303,10 @@ server.on("error", (error) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`Job dashboard running at http://${HOST}:${PORT}`);
-  maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message));
-  maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message));
-  setInterval(() => maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message)), 60 * 60 * 1000);
-  setInterval(() => maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message)), 60 * 60 * 1000);
+  setTimeout(() => {
+    runBackgroundMaintenance().catch((error) => console.error("Background maintenance failed:", error.message));
+  }, Math.max(10000, BACKGROUND_JOBS_FIRST_RUN_DELAY_MS));
+  setInterval(() => {
+    runBackgroundMaintenance().catch((error) => console.error("Background maintenance failed:", error.message));
+  }, Math.max(60000, BACKGROUND_JOBS_INTERVAL_MS));
 });

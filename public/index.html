@@ -88,6 +88,17 @@
           <div class="topbar-actions">
             <span id="topbarUserBadge" class="status-chip">Signed in</span>
           </div>
+          <div id="topbarProgress" class="topbar-progress" role="progressbar" aria-label="Loading dashboard updates" hidden>
+            <span></span>
+          </div>
+          <div id="appBootOverlay" class="app-boot-banner" role="status" aria-live="polite" aria-atomic="true" hidden>
+            <div class="app-boot-banner-copy">
+              <span class="app-boot-dot" aria-hidden="true"></span>
+              <p id="appBootStatus" class="app-boot-status">Connecting to workspace...</p>
+              <p id="appBootError" class="app-boot-error" hidden></p>
+            </div>
+            <button id="appBootRetry" class="primary-button" type="button" hidden>Retry</button>
+          </div>
         </header>
 
         <section id="overviewView" class="view active">
@@ -466,7 +477,6 @@
         </section>
       </section>
     </main>
-
     <script type="module" src="./app.js?v=blue-dashboard-2"></script>
   </body>
 </html>
