@@ -10,6 +10,10 @@ npm start
 
 Open `http://127.0.0.1:4173`.
 
+The app now requires Supabase Postgres through `DATABASE_URL`. For local
+development, point `.env` at the Supabase **dev** project. Render production
+should point at the Supabase **prod** project.
+
 ## How It Works
 
 - Save your target roles, skills, locations, seniority, and avoid words in the Profile view.
@@ -26,15 +30,65 @@ Open `http://127.0.0.1:4173`.
 - Move jobs through New, Shortlisted, Applied, or Passed from the company results table.
 - Upload or paste resume text in the Profile view to get targeted edit recommendations.
 
-## LLM Summaries
+## Supabase Setup
 
-Create a local `.env` file to generate LLM-written job summaries without typing your API key every time:
+Create a local `.env` file:
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env` and replace `sk-your-api-key-here` with your OpenAI API key. By default, summaries use `gpt-5-nano`, OpenAI's smallest GPT-5 option for low-cost summarization. Optional: change `OPENAI_SUMMARY_MODEL` to choose another model. Without an API key, the app uses extracted posting text as a fallback.
+Set `DATABASE_URL` to your Supabase Postgres Session Pooler connection string.
+Use the dev project locally and the prod project in Render. Keep
+`DATABASE_SSL=require` unless you are deliberately connecting to a local
+Postgres instance.
+
+The server runs `migrations/001_initial_supabase.sql` on startup.
+
+To migrate existing local SQLite data into Supabase:
+
+```bash
+npm run migrate:supabase:dry-run
+npm run migrate:supabase
+```
+
+The migration copies users, user stores, usage, feedback, company catalog,
+company requests, and sent email digest history. Active sessions are not
+migrated, so users sign in again after migration.
+
+## Render Deploy
+
+This repo includes `render.yaml`. Configure the Render service with:
+
+```bash
+HOST=0.0.0.0
+DATABASE_URL=your_prod_supabase_session_pooler_url
+DATABASE_SSL=require
+PUBLIC_APP_URL=https://your-render-or-custom-domain
+OPENAI_API_KEY=...
+RESEND_API_KEY=...
+EMAIL_FROM="AI Job Tracker <jobs@ai-job-tracker.com>"
+EMAIL_REPLY_TO=you@example.com
+ADMIN_EMAIL=admin@ai-job-tracker.com
+ADMIN_PASSWORD=replace_with_a_strong_password
+```
+
+Health check:
+
+```bash
+curl https://your-render-or-custom-domain/api/health
+```
+
+## LLM Summaries
+
+Add your OpenAI key in `.env` locally and in Render env vars for production:
+
+```bash
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_SUMMARY_MODEL=gpt-5-nano
+```
+
+Without an API key, the app uses extracted posting text as a fallback.
 
 The app checks for a fresh scrape when the server starts and then checks hourly whether a new daily scrape is due. The server needs to be running for automatic daily scans.
 
@@ -58,4 +112,7 @@ Verify `ai-job-tracker.com` in Resend and add the DNS records in Cloudflare befo
 
 ## Data
 
-User accounts, sent digest history, usage, and feedback are stored locally in `data/app.db`. Each user's profile, resume text, companies, scanned jobs, and application statuses are stored separately under `data/users/`.
+User accounts, sent digest history, usage, and feedback are stored in Supabase
+Postgres. Each user's profile, resume text, companies, scanned jobs,
+application statuses, cache, and scan history live in `user_stores.data` as
+JSONB.

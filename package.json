@@ -4,9 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate:supabase:dry-run": "node scripts/migrate-sqlite-to-supabase.mjs --dry-run",
+    "migrate:supabase": "node scripts/migrate-sqlite-to-supabase.mjs --apply"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   }
 }

@@ -9,8 +9,8 @@ https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md
 
 - Read `APP_CONTEXT.md` before changing scanner, matching, cache, email, auth,
   parser, company catalog, or deployment behavior.
-- Prefer small, behavior-preserving changes. This app is used live through a
-  local server and Cloudflare Tunnel, so regressions are immediately visible.
+- Prefer small, behavior-preserving changes. This app is intended to run on
+  Render against Supabase Postgres, so regressions can affect real users.
 - Do not edit or commit secrets, local databases, credentials, or generated
   runtime data. Keep `.env`, `data/`, and database WAL/SHM files out of git.
 - Do not wipe user job history after a failed scan. Successful companies may
@@ -25,13 +25,13 @@ https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md
 
 - Runtime: Node.js native `http` server in `server.js`.
 - Frontend: plain HTML/CSS/JavaScript in `public/`.
-- Storage: SQLite via Node `DatabaseSync`, plus JSON user stores inside
-  `user_stores.data`.
+- Storage: Supabase Postgres through `DATABASE_URL`, with JSONB user stores
+  inside `user_stores.data`.
 - LLM provider: OpenAI Responses API, currently configured by
   `OPENAI_SUMMARY_MODEL` and `OPENAI_API_KEY`.
 - Email provider: Resend, configured with `RESEND_API_KEY`, `EMAIL_FROM`, and
   `EMAIL_REPLY_TO`.
-- Public access: usually via Cloudflare Tunnel to the local server.
+- Public access: Render web service, usually behind `ai-job-tracker.com`.
 
 Keep this stack unless the user explicitly asks for a larger migration. React,
 Express, background queues, or normalized job tables may be useful later, but
@@ -85,7 +85,7 @@ Current external services include:
   - Walmart careers APIs and detail pages
 - OpenAI Responses API for summaries and relevance.
 - Resend API for email digests.
-- Cloudflare Tunnel outside the app process for public routing.
+- Render outside the app process for hosting and public routing.
 
 When adding a company parser, first make the parser observable for admins:
 parser name, raw jobs, saved jobs, detail fetches, LLM/cache counts, issues, and

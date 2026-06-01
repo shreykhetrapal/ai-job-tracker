@@ -6,7 +6,7 @@ import { createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypt
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import pg from "pg";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -14,10 +14,13 @@ await loadLocalEnv(path.join(__dirname, ".env"));
 
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const DATABASE_SSL = process.env.DATABASE_SSL || "require";
+const DATABASE_POOL_MAX = Number(process.env.DATABASE_POOL_MAX || 8);
 const DATA_DIR = path.join(__dirname, "data");
 const STORE_PATH = path.join(DATA_DIR, "store.json");
-const DB_PATH = path.join(DATA_DIR, "app.db");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const MIGRATIONS_DIR = path.join(__dirname, "migrations");
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_JOB_MONTHS = 2;
 const SESSION_DAYS = Number(process.env.SESSION_DAYS || 14);
@@ -31,6 +34,7 @@ const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
 const DEFAULT_EMAIL_DIGEST_MAX_JOBS = 10;
 const DASHBOARD_URL = process.env.PUBLIC_APP_URL || process.env.APP_URL || "https://ai-job-tracker.com/#jobs";
 const emailPattern = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+const serverStartedAt = new Date().toISOString();
 
 const jobMatchResponseFormat = {
   type: "json_schema",
@@ -229,100 +233,48 @@ const mimeTypes = {
 
 await mkdir(DATA_DIR, { recursive: true });
 
-const db = new DatabaseSync(DB_PATH);
-db.exec("PRAGMA journal_mode = WAL");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    is_admin INTEGER NOT NULL DEFAULT 0,
-    disabled INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS user_stores (
-    user_id TEXT PRIMARY KEY,
-    data TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS usage_events (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    type TEXT NOT NULL,
-    count INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS feedback_entries (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    message TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS company_catalog (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    careers_url TEXT NOT NULL UNIQUE,
-    notes TEXT NOT NULL DEFAULT '',
-    scanner TEXT NOT NULL DEFAULT '',
-    source_request_id TEXT,
-    created_by TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS company_requests (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    careers_url TEXT NOT NULL,
-    notes TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending',
-    test_status TEXT,
-    test_summary TEXT,
-    admin_notes TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    reviewed_at TEXT,
-    reviewed_by TEXT,
-    FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(reviewed_by) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS email_digest_sends (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    job_key TEXT NOT NULL,
-    digest_id TEXT NOT NULL,
-    company TEXT NOT NULL,
-    title TEXT NOT NULL,
-    relevance_score INTEGER,
-    sent_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id),
-    UNIQUE(user_id, job_key)
-  );
-`);
-
-function ensureColumn(table, column, definition) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((item) => item.name);
-  if (!columns.includes(column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
+if (!DATABASE_URL) {
+  throw new Error("DATABASE_URL is required. Use your Supabase Postgres Session Pooler connection string.");
 }
 
-ensureColumn("company_catalog", "test_status", "TEXT");
-ensureColumn("company_catalog", "test_summary", "TEXT");
-ensureColumn("company_catalog", "last_tested_at", "TEXT");
+const { Pool } = pg;
+const db = new Pool({
+  connectionString: DATABASE_URL,
+  max: Number.isFinite(DATABASE_POOL_MAX) && DATABASE_POOL_MAX > 0 ? DATABASE_POOL_MAX : 8,
+  ssl: DATABASE_SSL === "disable" ? false : { rejectUnauthorized: false }
+});
 
-function userCount() {
-  return db.prepare("SELECT COUNT(*) AS count FROM users").get().count;
+function toPostgresSql(sql) {
+  let index = 0;
+  return String(sql).replace(/\?/g, () => `$${++index}`);
+}
+
+async function dbGet(sql, params = []) {
+  const result = await db.query(toPostgresSql(sql), params);
+  return result.rows[0] || null;
+}
+
+async function dbAll(sql, params = []) {
+  const result = await db.query(toPostgresSql(sql), params);
+  return result.rows;
+}
+
+async function dbRun(sql, params = []) {
+  return db.query(toPostgresSql(sql), params);
+}
+
+async function dbExec(sql) {
+  return db.query(sql);
+}
+
+async function initializeDatabase() {
+  await dbExec(await readFile(path.join(MIGRATIONS_DIR, "001_initial_supabase.sql"), "utf8"));
+}
+
+await initializeDatabase();
+
+async function userCount() {
+  return Number((await dbGet("SELECT COUNT(*) AS count FROM users"))?.count || 0);
 }
 
 function hashPassword(password) {
@@ -339,7 +291,7 @@ function verifyPassword(password, storedHash) {
   return expected.length === candidate.length && timingSafeEqual(candidate, expected);
 }
 
-function createUser(email, password, isAdmin = false) {
+async function createUser(email, password, isAdmin = false) {
   const normalizedEmail = String(email || "").trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) throw new Error("Use a valid email address.");
   if (String(password || "").length < 10) throw new Error("Use a password with at least 10 characters.");
@@ -350,9 +302,8 @@ function createUser(email, password, isAdmin = false) {
     is_admin: isAdmin ? 1 : 0,
     created_at: new Date().toISOString()
   };
-  db.prepare("INSERT INTO users (id, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)")
-    .run(user.id, user.email, user.password_hash, user.is_admin, user.created_at);
-  writeStore(user.id, structuredClone(defaultStore));
+  await dbRun("INSERT INTO users (id, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)", [user.id, user.email, user.password_hash, user.is_admin, user.created_at]);
+  await writeStore(user.id, structuredClone(defaultStore));
   return publicUser(user);
 }
 
@@ -376,7 +327,7 @@ function publicFeedback(row) {
   };
 }
 
-function listFeedback(user) {
+async function listFeedback(user) {
   const sql = user.isAdmin
     ? `SELECT feedback_entries.*, users.email
        FROM feedback_entries
@@ -387,18 +338,17 @@ function listFeedback(user) {
        JOIN users ON users.id = feedback_entries.user_id
        WHERE feedback_entries.user_id = ?
        ORDER BY feedback_entries.created_at DESC`;
-  const rows = user.isAdmin ? db.prepare(sql).all() : db.prepare(sql).all(user.id);
+  const rows = user.isAdmin ? await dbAll(sql) : await dbAll(sql, [user.id]);
   return rows.map(publicFeedback);
 }
 
-function createFeedback(user, message) {
+async function createFeedback(user, message) {
   const text = cleanText(message).slice(0, 4000);
   if (text.length < 3) throw new Error("Add a little more feedback before submitting.");
-  db.prepare("INSERT INTO feedback_entries (id, user_id, message, created_at) VALUES (?, ?, ?, ?)")
-    .run(`feedback-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`, user.id, text, new Date().toISOString());
+  await dbRun("INSERT INTO feedback_entries (id, user_id, message, created_at) VALUES (?, ?, ?, ?)", [`feedback-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`, user.id, text, new Date().toISOString()]);
 }
 
-function listCompanyRequests(user) {
+async function listCompanyRequests(user) {
   const sql = user.isAdmin
     ? `SELECT company_requests.*, users.email
        FROM company_requests
@@ -409,40 +359,40 @@ function listCompanyRequests(user) {
        JOIN users ON users.id = company_requests.user_id
        WHERE company_requests.user_id = ?
        ORDER BY company_requests.created_at DESC`;
-  const rows = user.isAdmin ? db.prepare(sql).all() : db.prepare(sql).all(user.id);
+  const rows = user.isAdmin ? await dbAll(sql) : await dbAll(sql, [user.id]);
   return rows.map(requestRowToCompanyRequest);
 }
 
-function getCompanyRequest(id) {
-  const row = db.prepare(`
+async function getCompanyRequest(id) {
+  const row = await dbGet(`
     SELECT company_requests.*, users.email
     FROM company_requests
     JOIN users ON users.id = company_requests.user_id
     WHERE company_requests.id = ?
-  `).get(String(id || ""));
+  `, [String(id || "")]);
   if (!row) throw new Error("Company request not found.");
   return row;
 }
 
-function createCompanyRequest(user, input = {}) {
+async function createCompanyRequest(user, input = {}) {
   const name = cleanText(input.name).slice(0, 160);
   const careersUrl = normalizeUrl(input.careersUrl);
   const notes = cleanText(input.notes).slice(0, 1000);
   if (name.length < 2) throw new Error("Add a company name.");
   if (!careersUrl) throw new Error("Add a valid careers URL.");
-  if (findCatalogCompany({ careersUrl })) {
+  if (await findCatalogCompany({ careersUrl })) {
     throw new Error("That company URL is already available. Select it from the available companies list.");
   }
-  const existing = db.prepare(`
+  const existing = await dbGet(`
     SELECT id FROM company_requests
     WHERE user_id = ? AND lower(careers_url) = lower(?) AND status IN ('pending', 'tested', 'test_failed')
-  `).get(user.id, careersUrl);
+  `, [user.id, careersUrl]);
   if (existing) throw new Error("You already have an open request for that careers URL.");
   const now = new Date().toISOString();
-  db.prepare(`
+  await dbRun(`
     INSERT INTO company_requests (id, user_id, name, careers_url, notes, status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-  `).run(`company-request-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`, user.id, name, careersUrl, notes, now, now);
+  `, [`company-request-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`, user.id, name, careersUrl, notes, now, now]);
 }
 
 function companyTestSummaryFromResult(company, result) {
@@ -490,31 +440,31 @@ async function runCompanyParserTest(company, adminUser, scope = "company parser 
 }
 
 async function testCompanyRequest(requestId, adminUser) {
-  const request = getCompanyRequest(requestId);
+  const request = await getCompanyRequest(requestId);
   const company = normalizeCompany({
     name: request.name,
     careersUrl: request.careers_url,
     notes: request.notes
   });
   const { summary, passed } = await runCompanyParserTest(company, adminUser, "company request test", true);
-  db.prepare(`
+  await dbRun(`
     UPDATE company_requests
     SET status = ?, test_status = ?, test_summary = ?, updated_at = ?
     WHERE id = ?
-  `).run(passed ? "tested" : "test_failed", passed ? "passed" : "failed", JSON.stringify(summary), new Date().toISOString(), request.id);
+  `, [passed ? "tested" : "test_failed", passed ? "passed" : "failed", JSON.stringify(summary), new Date().toISOString(), request.id]);
   return summary;
 }
 
 async function testCompanyCatalogCompany(companyId, adminUser) {
-  const company = findCatalogCompany({ id: companyId });
+  const company = await findCatalogCompany({ id: companyId });
   if (!company) throw new Error("Company not found.");
   const { summary, passed } = await runCompanyParserTest(company, adminUser, "company catalog test", false);
   const now = new Date().toISOString();
-  db.prepare(`
+  await dbRun(`
     UPDATE company_catalog
     SET test_status = ?, test_summary = ?, last_tested_at = ?, updated_at = ?
     WHERE id = ?
-  `).run(passed ? "passed" : "failed", JSON.stringify(summary), summary.testedAt || now, now, company.id);
+  `, [passed ? "passed" : "failed", JSON.stringify(summary), summary.testedAt || now, now, company.id]);
   return summary;
 }
 
@@ -552,9 +502,9 @@ function companyRequestTestProfile() {
   };
 }
 
-function approveCompanyRequest(requestId, adminUser) {
-  const request = getCompanyRequest(requestId);
-  const catalogCompany = upsertCompanyCatalog({
+async function approveCompanyRequest(requestId, adminUser) {
+  const request = await getCompanyRequest(requestId);
+  const catalogCompany = await upsertCompanyCatalog({
     name: request.name,
     careersUrl: request.careers_url,
     notes: request.notes
@@ -562,35 +512,35 @@ function approveCompanyRequest(requestId, adminUser) {
     sourceRequestId: request.id,
     createdBy: adminUser.id
   });
-  db.prepare(`
+  await dbRun(`
     UPDATE company_requests
     SET status = 'approved', reviewed_by = ?, reviewed_at = ?, updated_at = ?
     WHERE id = ?
-  `).run(adminUser.id, new Date().toISOString(), new Date().toISOString(), request.id);
+  `, [adminUser.id, new Date().toISOString(), new Date().toISOString(), request.id]);
   return catalogCompany;
 }
 
-function rejectCompanyRequest(requestId, adminUser, adminNotes = "") {
-  const request = getCompanyRequest(requestId);
-  db.prepare(`
+async function rejectCompanyRequest(requestId, adminUser, adminNotes = "") {
+  const request = await getCompanyRequest(requestId);
+  await dbRun(`
     UPDATE company_requests
     SET status = 'rejected', admin_notes = ?, reviewed_by = ?, reviewed_at = ?, updated_at = ?
     WHERE id = ?
-  `).run(cleanText(adminNotes).slice(0, 1000), adminUser.id, new Date().toISOString(), new Date().toISOString(), request.id);
+  `, [cleanText(adminNotes).slice(0, 1000), adminUser.id, new Date().toISOString(), new Date().toISOString(), request.id]);
 }
 
-function sentJobKeys(userId) {
-  return new Set(db.prepare("SELECT job_key FROM email_digest_sends WHERE user_id = ?").all(userId).map((row) => row.job_key));
+async function sentJobKeys(userId) {
+  return new Set((await dbAll("SELECT job_key FROM email_digest_sends WHERE user_id = ?", [userId])).map((row) => row.job_key));
 }
 
-function recordEmailDigestSends(userId, digestId, jobs) {
+async function recordEmailDigestSends(userId, digestId, jobs) {
   const sentAt = new Date().toISOString();
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO email_digest_sends (id, user_id, job_key, digest_id, company, title, relevance_score, sent_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
   for (const job of jobs) {
-    insert.run(
+    await dbRun(`
+    INSERT INTO email_digest_sends (id, user_id, job_key, digest_id, company, title, relevance_score, sent_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (user_id, job_key) DO NOTHING
+  `, [
       `email-send-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`,
       userId,
       jobDetailCacheKey(job),
@@ -599,41 +549,45 @@ function recordEmailDigestSends(userId, digestId, jobs) {
       job.title || "",
       clampRelevanceScore(job.relevanceScore),
       sentAt
-    );
+    ]);
   }
 }
 
-function listUsers() {
-  return db.prepare("SELECT id, email, is_admin, disabled, created_at FROM users ORDER BY created_at ASC").all().map((user) => ({
+async function listUsers() {
+  const users = await dbAll("SELECT id, email, is_admin, disabled, created_at FROM users ORDER BY created_at ASC");
+  return Promise.all(users.map(async (user) => ({
     ...publicUser(user),
     usage: {
-      today: dailyUsage(user.id),
-      total: totalUsage(user.id)
+      today: await dailyUsage(user.id),
+      total: await totalUsage(user.id)
     },
-    stats: userStoreStats(user.id)
-  }));
+    stats: await userStoreStats(user.id)
+  })));
 }
 
-function deleteUser(userId, actorId) {
+async function deleteUser(userId, actorId) {
   const targetId = String(userId || "");
   if (!targetId) throw new Error("User not found.");
   if (targetId === actorId) throw new Error("You cannot remove your own account while signed in.");
-  const target = db.prepare("SELECT id FROM users WHERE id = ?").get(targetId);
+  const target = await dbGet("SELECT id FROM users WHERE id = ?", [targetId]);
   if (!target) throw new Error("User not found.");
 
-  db.exec("BEGIN");
+  const client = await db.connect();
   try {
-    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(targetId);
-    db.prepare("DELETE FROM usage_events WHERE user_id = ?").run(targetId);
-    db.prepare("DELETE FROM feedback_entries WHERE user_id = ?").run(targetId);
-    db.prepare("DELETE FROM company_requests WHERE user_id = ?").run(targetId);
-    db.prepare("DELETE FROM email_digest_sends WHERE user_id = ?").run(targetId);
-    db.prepare("DELETE FROM user_stores WHERE user_id = ?").run(targetId);
-    db.prepare("DELETE FROM users WHERE id = ?").run(targetId);
-    db.exec("COMMIT");
+    await client.query("BEGIN");
+    await client.query(toPostgresSql("DELETE FROM sessions WHERE user_id = ?"), [targetId]);
+    await client.query(toPostgresSql("DELETE FROM usage_events WHERE user_id = ?"), [targetId]);
+    await client.query(toPostgresSql("DELETE FROM feedback_entries WHERE user_id = ?"), [targetId]);
+    await client.query(toPostgresSql("DELETE FROM company_requests WHERE user_id = ?"), [targetId]);
+    await client.query(toPostgresSql("DELETE FROM email_digest_sends WHERE user_id = ?"), [targetId]);
+    await client.query(toPostgresSql("DELETE FROM user_stores WHERE user_id = ?"), [targetId]);
+    await client.query(toPostgresSql("DELETE FROM users WHERE id = ?"), [targetId]);
+    await client.query("COMMIT");
   } catch (error) {
-    db.exec("ROLLBACK");
+    await client.query("ROLLBACK");
     throw error;
+  } finally {
+    client.release();
   }
 
   for (const [scanId, scanRun] of activeScanRuns.entries()) {
@@ -642,14 +596,14 @@ function deleteUser(userId, actorId) {
 }
 
 async function bootstrapFirstAdmin() {
-  if (userCount()) return;
+  if (await userCount()) return;
 
   const email = String(process.env.ADMIN_EMAIL || "admin@example.com").trim().toLowerCase();
   const password = process.env.ADMIN_PASSWORD || randomBytes(18).toString("base64url");
-  const admin = createUser(email, password, true);
+  const admin = await createUser(email, password, true);
   if (existsSync(STORE_PATH)) {
     const raw = await readFile(STORE_PATH, "utf8");
-    writeStore(admin.id, { ...structuredClone(defaultStore), ...JSON.parse(raw) });
+    await writeStore(admin.id, { ...structuredClone(defaultStore), ...JSON.parse(raw) });
   }
   if (!process.env.ADMIN_PASSWORD) {
     const loginPath = path.join(DATA_DIR, "admin-login.txt");
@@ -662,27 +616,29 @@ async function bootstrapFirstAdmin() {
 
 await bootstrapFirstAdmin();
 
-function readStore(userId) {
-  const row = db.prepare("SELECT data FROM user_stores WHERE user_id = ?").get(userId);
+async function readStore(userId) {
+  const row = await dbGet("SELECT data FROM user_stores WHERE user_id = ?", [userId]);
   if (!row) {
-    writeStore(userId, structuredClone(defaultStore));
+    await writeStore(userId, structuredClone(defaultStore));
     return structuredClone(defaultStore);
   }
-  return normalizeStore({ ...structuredClone(defaultStore), ...JSON.parse(row.data) });
+  const data = typeof row.data === "string" ? JSON.parse(row.data) : row.data;
+  return normalizeStore({ ...structuredClone(defaultStore), ...data });
 }
 
-function writeStore(userId, store) {
+async function writeStore(userId, store) {
   const normalizedStore = normalizeStore(store);
-  db.prepare(`
+  await dbRun(`
     INSERT INTO user_stores (user_id, data, updated_at)
-    VALUES (?, ?, ?)
+    VALUES (?, ?::jsonb, ?)
     ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at
-  `).run(userId, JSON.stringify(normalizedStore, null, 2), new Date().toISOString());
+  `, [userId, JSON.stringify(normalizedStore), new Date().toISOString()]);
 }
 
 function parseStoreRow(row) {
   try {
-    return normalizeStore({ ...structuredClone(defaultStore), ...JSON.parse(row.data) });
+    const data = typeof row.data === "string" ? JSON.parse(row.data) : row.data;
+    return normalizeStore({ ...structuredClone(defaultStore), ...data });
   } catch {
     return structuredClone(defaultStore);
   }
@@ -793,30 +749,30 @@ function requestRowToCompanyRequest(row) {
   };
 }
 
-function listCompanyCatalog(includeTest = false) {
-  return db.prepare("SELECT * FROM company_catalog ORDER BY name COLLATE NOCASE ASC").all()
+async function listCompanyCatalog(includeTest = false) {
+  return (await dbAll("SELECT * FROM company_catalog ORDER BY lower(name) ASC"))
     .map((row) => catalogRowToCompany(row, includeTest));
 }
 
-function findCatalogCompany(input = {}) {
+async function findCatalogCompany(input = {}) {
   const id = String(input.catalogId || input.id || "").trim();
   const careersUrl = normalizeUrl(input.careersUrl || "");
   const row = id
-    ? db.prepare("SELECT * FROM company_catalog WHERE id = ?").get(id)
+    ? await dbGet("SELECT * FROM company_catalog WHERE id = ?", [id])
     : careersUrl
-      ? db.prepare("SELECT * FROM company_catalog WHERE lower(careers_url) = lower(?)").get(careersUrl)
+      ? await dbGet("SELECT * FROM company_catalog WHERE lower(careers_url) = lower(?)", [careersUrl])
       : null;
   return row ? catalogRowToCompany(row) : null;
 }
 
-function upsertCompanyCatalog(input, { sourceRequestId = null, createdBy = null, scanner = "" } = {}) {
+async function upsertCompanyCatalog(input, { sourceRequestId = null, createdBy = null, scanner = "" } = {}) {
   const company = normalizeCompany(input);
   if (!company.name) throw new Error("Add a company name.");
   if (!company.careersUrl) throw new Error("Add a valid careers URL.");
   const now = new Date().toISOString();
-  const existing = db.prepare("SELECT * FROM company_catalog WHERE lower(careers_url) = lower(?)").get(company.careersUrl);
+  const existing = await dbGet("SELECT * FROM company_catalog WHERE lower(careers_url) = lower(?)", [company.careersUrl]);
   const id = existing?.id || company.id || makeId(company.name || company.careersUrl);
-  db.prepare(`
+  await dbRun(`
     INSERT INTO company_catalog (id, name, careers_url, notes, scanner, source_request_id, created_by, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(careers_url) DO UPDATE SET
@@ -825,7 +781,7 @@ function upsertCompanyCatalog(input, { sourceRequestId = null, createdBy = null,
       scanner = CASE WHEN excluded.scanner != '' THEN excluded.scanner ELSE company_catalog.scanner END,
       source_request_id = COALESCE(excluded.source_request_id, company_catalog.source_request_id),
       updated_at = excluded.updated_at
-  `).run(
+  `, [
     id,
     company.name,
     company.careersUrl,
@@ -835,28 +791,28 @@ function upsertCompanyCatalog(input, { sourceRequestId = null, createdBy = null,
     createdBy,
     existing?.created_at || now,
     now
-  );
+  ]);
   return findCatalogCompany({ careersUrl: company.careersUrl });
 }
 
-function seedCompanyCatalog() {
+async function seedCompanyCatalog() {
   for (const company of defaultCompanyCatalog) {
-    upsertCompanyCatalog(company, { scanner: company.scanner || "" });
+    await upsertCompanyCatalog(company, { scanner: company.scanner || "" });
   }
-  const rows = db.prepare("SELECT data FROM user_stores").all();
+  const rows = await dbAll("SELECT data FROM user_stores");
   for (const row of rows) {
     const store = parseStoreRow(row);
     for (const company of store.targetCompanies || []) {
       if (!company?.careersUrl) continue;
-      upsertCompanyCatalog(company, { scanner: company.scanner || "" });
+      await upsertCompanyCatalog(company, { scanner: company.scanner || "" });
     }
   }
-  dedupeCompanyCatalog();
+  await dedupeCompanyCatalog();
 }
 
-function dedupeCompanyCatalog() {
+async function dedupeCompanyCatalog() {
   const defaultUrls = new Set(defaultCompanyCatalog.map((company) => normalizeUrl(company.careersUrl).toLowerCase()));
-  const rows = db.prepare("SELECT * FROM company_catalog ORDER BY created_at ASC").all()
+  const rows = (await dbAll("SELECT * FROM company_catalog ORDER BY created_at ASC"))
     .sort((a, b) => {
       const aDefault = defaultUrls.has(normalizeUrl(a.careers_url).toLowerCase()) ? 0 : 1;
       const bDefault = defaultUrls.has(normalizeUrl(b.careers_url).toLowerCase()) ? 0 : 1;
@@ -876,13 +832,12 @@ function dedupeCompanyCatalog() {
     seenNames.add(canonicalName);
   }
   for (const id of deleteIds) {
-    db.prepare("DELETE FROM company_catalog WHERE id = ?").run(id);
+    await dbRun("DELETE FROM company_catalog WHERE id = ?", [id]);
   }
-  for (const row of db.prepare("SELECT id, careers_url FROM company_catalog").all()) {
+  for (const row of await dbAll("SELECT id, careers_url FROM company_catalog")) {
     const canonicalUrl = normalizeUrl(row.careers_url);
     if (canonicalUrl && canonicalUrl !== row.careers_url) {
-      db.prepare("UPDATE company_catalog SET careers_url = ?, updated_at = ? WHERE id = ?")
-        .run(canonicalUrl, new Date().toISOString(), row.id);
+      await dbRun("UPDATE company_catalog SET careers_url = ?, updated_at = ? WHERE id = ?", [canonicalUrl, new Date().toISOString(), row.id]);
     }
   }
 }
@@ -899,7 +854,7 @@ function sharedCompanyBase(company) {
   };
 }
 
-seedCompanyCatalog();
+await seedCompanyCatalog();
 
 function parseCookies(req) {
   return Object.fromEntries(String(req.headers.cookie || "")
@@ -919,36 +874,34 @@ function cookieHeader(name, value, options = {}) {
   return parts.join("; ");
 }
 
-function createSession(userId) {
+async function createSession(userId) {
   const id = randomBytes(32).toString("base64url");
   const createdAt = new Date().toISOString();
   const expiresAt = new Date(Date.now() + SESSION_DAYS * ONE_DAY_MS).toISOString();
-  db.prepare("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
-    .run(id, userId, createdAt, expiresAt);
+  await dbRun("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)", [id, userId, createdAt, expiresAt]);
   return { id, expiresAt };
 }
 
-function authenticatedUser(req) {
+async function authenticatedUser(req) {
   const sessionId = parseCookies(req).sid;
   if (!sessionId) return null;
-  const row = db.prepare(`
+  const row = await dbGet(`
     SELECT users.id, users.email, users.is_admin, users.disabled, users.created_at, sessions.expires_at
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.id = ?
-  `).get(sessionId);
+  `, [sessionId]);
   if (!row || row.disabled || safeDate(row.expires_at) < Date.now()) return null;
   return publicUser(row);
 }
 
-function deleteSession(req) {
+async function deleteSession(req) {
   const sessionId = parseCookies(req).sid;
-  if (sessionId) db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+  if (sessionId) await dbRun("DELETE FROM sessions WHERE id = ?", [sessionId]);
 }
 
-function usageSince(userId, type, sinceIso) {
-  const row = db.prepare("SELECT COALESCE(SUM(count), 0) AS total FROM usage_events WHERE user_id = ? AND type = ? AND created_at >= ?")
-    .get(userId, type, sinceIso);
+async function usageSince(userId, type, sinceIso) {
+  const row = await dbGet("SELECT COALESCE(SUM(count), 0) AS total FROM usage_events WHERE user_id = ? AND type = ? AND created_at >= ?", [userId, type, sinceIso]);
   return Number(row?.total || 0);
 }
 
@@ -958,32 +911,32 @@ function todayIsoStart() {
   return date.toISOString();
 }
 
-function dailyUsage(userId) {
+async function dailyUsage(userId) {
   const since = todayIsoStart();
   return {
-    scans: usageSince(userId, "scan", since),
-    llmCalls: usageSince(userId, "llm", since),
+    scans: await usageSince(userId, "scan", since),
+    llmCalls: await usageSince(userId, "llm", since),
     scanLimit: DAILY_SCAN_LIMIT,
     llmLimit: DAILY_LLM_LIMIT
   };
 }
 
-function totalUsage(userId) {
-  const row = db.prepare(`
+async function totalUsage(userId) {
+  const row = await dbGet(`
     SELECT
       COALESCE(SUM(CASE WHEN type = 'scan' THEN count ELSE 0 END), 0) AS scans,
       COALESCE(SUM(CASE WHEN type = 'llm' THEN count ELSE 0 END), 0) AS llmCalls
     FROM usage_events
     WHERE user_id = ?
-  `).get(userId);
+  `, [userId]);
   return {
     scans: Number(row?.scans || 0),
-    llmCalls: Number(row?.llmCalls || 0)
+    llmCalls: Number(row?.llmcalls || row?.llmCalls || 0)
   };
 }
 
-function userStoreStats(userId) {
-  const store = readStore(userId);
+async function userStoreStats(userId) {
+  const store = await readStore(userId);
   return {
     companies: store.targetCompanies?.length || 0,
     jobs: store.companyScanJobs?.length || 0,
@@ -992,18 +945,17 @@ function userStoreStats(userId) {
   };
 }
 
-function assertCanScan(userId) {
-  const usage = dailyUsage(userId);
+async function assertCanScan(userId) {
+  const usage = await dailyUsage(userId);
   if (usage.scans >= usage.scanLimit) throw new Error(`Daily scan limit reached (${usage.scanLimit}).`);
   if (Number.isFinite(usage.llmLimit) && usage.llmLimit > 0 && usage.llmCalls >= usage.llmLimit) {
     throw new Error(`Daily LLM call limit reached (${usage.llmLimit}).`);
   }
 }
 
-function recordUsage(userId, type, count = 1) {
+async function recordUsage(userId, type, count = 1) {
   if (!count) return;
-  db.prepare("INSERT INTO usage_events (id, user_id, type, count, created_at) VALUES (?, ?, ?, ?, ?)")
-    .run(`usage-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`, userId, type, count, new Date().toISOString());
+  await dbRun("INSERT INTO usage_events (id, user_id, type, count, created_at) VALUES (?, ?, ?, ?, ?)", [`usage-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`, userId, type, count, new Date().toISOString()]);
 }
 
 function normalizeList(value) {
@@ -1300,18 +1252,19 @@ function sanitizeScannerRuns(scanRuns = []) {
   return scanRuns.map(sanitizeScannerRun);
 }
 
-function listFailedScanRunsForAdmin() {
-  const rows = db.prepare(`
+async function listFailedScanRunsForAdmin() {
+  const rows = await dbAll(`
     SELECT users.id AS user_id, users.email, user_stores.data
     FROM user_stores
     JOIN users ON users.id = user_stores.user_id
     WHERE users.disabled = 0
-  `).all();
+  `);
   const failures = [];
   for (const row of rows) {
     let store;
     try {
-      store = normalizeStore({ ...structuredClone(defaultStore), ...JSON.parse(row.data || "{}") });
+      const data = typeof row.data === "string" ? JSON.parse(row.data || "{}") : (row.data || {});
+      store = normalizeStore({ ...structuredClone(defaultStore), ...data });
     } catch {
       store = structuredClone(defaultStore);
     }
@@ -1333,8 +1286,8 @@ function listFailedScanRunsForAdmin() {
     .slice(0, 80);
 }
 
-function getScannerState(user) {
-  const store = readStore(user.id);
+async function getScannerState(user) {
+  const store = await readStore(user.id);
   const activeRuns = [...activeScanRuns.values()].filter((run) => run.userId === user.id);
   if (!user.isAdmin) {
     return {
@@ -1345,7 +1298,7 @@ function getScannerState(user) {
   return {
     activeScanRuns: activeRuns,
     scanRuns: store.scanRuns || [],
-    failedScanRuns: listFailedScanRunsForAdmin()
+    failedScanRuns: await listFailedScanRunsForAdmin()
   };
 }
 
@@ -4538,8 +4491,8 @@ function resumeRecommendations(profile, resumeText, jobs) {
   return recommendations;
 }
 
-function getState(user) {
-  const store = readStore(user.id);
+async function getState(user) {
+  const store = await readStore(user.id);
   const repairedJobs = repairCandidateCentricSummaries(store.companyScanJobs || [], store.jobDetailCache || {});
   const companyScanJobs = annotateJobs(repairedJobs, store.profile, store.jobFeedback || {});
   const {
@@ -4554,15 +4507,15 @@ function getState(user) {
   return {
     ...publicStore,
     scanRuns: publicScanRuns,
-    failedScanRuns: user.isAdmin ? listFailedScanRunsForAdmin() : [],
+    failedScanRuns: user.isAdmin ? await listFailedScanRunsForAdmin() : [],
     emailDigest: normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email),
     emailDigestStatus: emailDigestStatus(store),
     currentUser: user,
-    availableCompanies: listCompanyCatalog(user.isAdmin),
-    companyRequests: listCompanyRequests(user),
-    users: user.isAdmin ? listUsers() : [],
-    feedbackEntries: listFeedback(user),
-    usage: dailyUsage(user.id),
+    availableCompanies: await listCompanyCatalog(user.isAdmin),
+    companyRequests: await listCompanyRequests(user),
+    users: user.isAdmin ? await listUsers() : [],
+    feedbackEntries: await listFeedback(user),
+    usage: await dailyUsage(user.id),
     jobs: companyScanJobs,
     companyScanJobs,
     jobDetailCacheStats: {
@@ -4704,7 +4657,7 @@ async function sendEmail({ to, subject, html, text }) {
 }
 
 async function runEmailDigestForUser(user, { force = false, test = false } = {}) {
-  const store = readStore(user.id);
+  const store = await readStore(user.id);
   store.emailDigest = normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email);
   const settings = store.emailDigest;
   if (!test && !force && !shouldRunEmailDigest(settings)) return { skipped: true, reason: "Not scheduled yet." };
@@ -4718,35 +4671,35 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
       text: `Your AI Job Tracker email digest is connected.\nFrom: ${EMAIL_FROM || "not configured"}`
     });
     store.emailDigest.lastDigestStatus = `Test email sent to ${settings.email}.`;
-    writeStore(user.id, store);
+    await writeStore(user.id, store);
     return { sent: true, count: 0, test: true };
   }
 
   const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "email digest", store.resumeText || "", store.jobDetailCache || {}, user.id);
-  recordUsage(user.id, "scan", 1);
-  recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+  await recordUsage(user.id, "scan", 1);
+  await recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
   const digestScanJobs = result.companyScanJobs || [];
   applyScanResultToStore(store, result);
   addScanRun(store, result.scanRun);
 
-  const eligibleCandidates = digestEligibleJobs(digestScanJobs, store, sentJobKeys(user.id));
+  const eligibleCandidates = digestEligibleJobs(digestScanJobs, store, await sentJobKeys(user.id));
   const candidates = eligibleCandidates.slice(0, emailDigestMaxJobs(settings));
   if (!candidates.length) {
     result.scanRun.emailDigest = emailDigestScanSummary(result.scanRun, settings, [], eligibleCandidates.length, "no_matches");
     store.emailDigest.lastDigestSentAt = new Date().toISOString();
     store.emailDigest.lastDigestStatus = "No new relevant jobs found.";
-    writeStore(user.id, store);
+    await writeStore(user.id, store);
     return { sent: false, count: 0 };
   }
 
   const digestId = `digest-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`;
   const message = renderDigestEmail(user, candidates, settings, eligibleCandidates.length);
   await sendEmail({ to: settings.email, ...message });
-  recordEmailDigestSends(user.id, digestId, candidates);
+  await recordEmailDigestSends(user.id, digestId, candidates);
   result.scanRun.emailDigest = emailDigestScanSummary(result.scanRun, settings, candidates, eligibleCandidates.length, "sent", digestId);
   store.emailDigest.lastDigestSentAt = new Date().toISOString();
   store.emailDigest.lastDigestStatus = `Sent ${candidates.length} of ${eligibleCandidates.length} new relevant opening${eligibleCandidates.length === 1 ? "" : "s"} to ${settings.email}.`;
-  writeStore(user.id, store);
+  await writeStore(user.id, store);
   return { sent: true, count: candidates.length };
 }
 
@@ -4778,33 +4731,33 @@ async function serveStatic(req, res) {
 }
 
 async function maybeDailyScrape() {
-  const users = db.prepare("SELECT id FROM users WHERE disabled = 0").all();
+  const users = await dbAll("SELECT id FROM users WHERE disabled = 0");
   for (const user of users) {
-    const store = readStore(user.id);
+    const store = await readStore(user.id);
     if (store.lastScrapeAt && Date.now() - safeDate(store.lastScrapeAt) < ONE_DAY_MS) continue;
     if (!store.targetCompanies?.length) continue;
     const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "daily", store.resumeText || "", store.jobDetailCache || {}, user.id);
-    recordUsage(user.id, "scan", 1);
-    recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+    await recordUsage(user.id, "scan", 1);
+    await recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
     applyScanResultToStore(store, result);
     addScanRun(store, result.scanRun);
-    writeStore(user.id, store);
+    await writeStore(user.id, store);
   }
 }
 
 async function maybeDailyEmailDigests() {
-  const users = db.prepare("SELECT id, email, is_admin, disabled, created_at FROM users WHERE disabled = 0").all().map(publicUser);
+  const users = (await dbAll("SELECT id, email, is_admin, disabled, created_at FROM users WHERE disabled = 0")).map(publicUser);
   for (const user of users) {
-    const store = readStore(user.id);
+    const store = await readStore(user.id);
     store.emailDigest = normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email);
     if (!shouldRunEmailDigest(store.emailDigest)) continue;
     try {
       await runEmailDigestForUser(user);
     } catch (error) {
-      const latest = readStore(user.id);
+      const latest = await readStore(user.id);
       latest.emailDigest = normalizeEmailDigest(latest.emailDigest || {}, latest.emailDigest || {}, user.email);
       latest.emailDigest.lastDigestStatus = `Email failed: ${error.message}`;
-      writeStore(user.id, latest);
+      await writeStore(user.id, latest);
       console.error(`Email digest failed for ${user.email}:`, error.message);
     }
   }
@@ -4814,15 +4767,35 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
+    if (req.method === "GET" && url.pathname === "/api/health") {
+      try {
+        await dbGet("SELECT 1 AS ok");
+        sendJson(res, 200, {
+          ok: true,
+          database: "ok",
+          storage: "supabase-postgres",
+          startedAt: serverStartedAt,
+          version: "1.0.0"
+        });
+      } catch (error) {
+        sendJson(res, 503, {
+          ok: false,
+          database: "error",
+          error: error.message
+        });
+      }
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/login") {
       const body = await parseBody(req);
       const email = String(body.email || "").trim().toLowerCase();
-      const userRow = db.prepare("SELECT * FROM users WHERE email = ? AND disabled = 0").get(email);
+      const userRow = await dbGet("SELECT * FROM users WHERE email = ? AND disabled = 0", [email]);
       if (!userRow || !verifyPassword(body.password || "", userRow.password_hash)) {
         sendJson(res, 401, { error: "Invalid email or password." });
         return;
       }
-      const session = createSession(userRow.id);
+      const session = await createSession(userRow.id);
       res.setHeader("Set-Cookie", cookieHeader("sid", session.id, {
         maxAge: SESSION_DAYS * 24 * 60 * 60,
         secure: req.headers["x-forwarded-proto"] === "https"
@@ -4832,13 +4805,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/logout") {
-      deleteSession(req);
+      await deleteSession(req);
       res.setHeader("Set-Cookie", cookieHeader("sid", "", { maxAge: 0 }));
       sendJson(res, 200, { ok: true });
       return;
     }
 
-    const user = authenticatedUser(req);
+    const user = await authenticatedUser(req);
     const isPublicAsset = url.pathname === "/login.html" || url.pathname === "/login.js" || url.pathname === "/styles.css";
     if (!user && url.pathname.startsWith("/api/")) {
       sendJson(res, 401, { error: "Sign in required." });
@@ -4856,7 +4829,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/state") {
-      sendJson(res, 200, getState(user));
+      sendJson(res, 200, await getState(user));
       return;
     }
 
@@ -4866,7 +4839,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/scanner") {
-      sendJson(res, 200, getScannerState(user));
+      sendJson(res, 200, await getScannerState(user));
       return;
     }
 
@@ -4876,8 +4849,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const body = await parseBody(req);
-      createUser(body.email, body.password, Boolean(body.isAdmin));
-      sendJson(res, 200, getState(user));
+      await createUser(body.email, body.password, Boolean(body.isAdmin));
+      sendJson(res, 200, await getState(user));
       return;
     }
 
@@ -4887,30 +4860,30 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const id = decodeURIComponent(url.pathname.replace("/api/users/", ""));
-      deleteUser(id, user.id);
-      sendJson(res, 200, getState(user));
+      await deleteUser(id, user.id);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/profile") {
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       store.profile = normalizeProfile(await parseBody(req));
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/feedback") {
       const body = await parseBody(req);
-      createFeedback(user, body.message || body.feedback || "");
-      sendJson(res, 200, getState(user));
+      await createFeedback(user, body.message || body.feedback || "");
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/company-requests") {
       const body = await parseBody(req);
-      createCompanyRequest(user, body);
-      sendJson(res, 200, getState(user));
+      await createCompanyRequest(user, body);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
@@ -4921,7 +4894,7 @@ const server = http.createServer(async (req, res) => {
       }
       const id = decodeURIComponent(url.pathname.replace("/api/company-catalog/", "").replace("/test", ""));
       await testCompanyCatalogCompany(id, user);
-      sendJson(res, 200, getState(user));
+      sendJson(res, 200, await getState(user));
       return;
     }
 
@@ -4932,7 +4905,7 @@ const server = http.createServer(async (req, res) => {
       }
       const id = decodeURIComponent(url.pathname.replace("/api/company-requests/", "").replace("/test", ""));
       await testCompanyRequest(id, user);
-      sendJson(res, 200, getState(user));
+      sendJson(res, 200, await getState(user));
       return;
     }
 
@@ -4942,8 +4915,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const id = decodeURIComponent(url.pathname.replace("/api/company-requests/", "").replace("/approve", ""));
-      approveCompanyRequest(id, user);
-      sendJson(res, 200, getState(user));
+      await approveCompanyRequest(id, user);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
@@ -4954,37 +4927,37 @@ const server = http.createServer(async (req, res) => {
       }
       const id = decodeURIComponent(url.pathname.replace("/api/company-requests/", "").replace("/reject", ""));
       const body = await parseBody(req);
-      rejectCompanyRequest(id, user, body.adminNotes || body.notes || "");
-      sendJson(res, 200, getState(user));
+      await rejectCompanyRequest(id, user, body.adminNotes || body.notes || "");
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/email-digest/settings") {
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       const body = await parseBody(req);
       store.emailDigest = normalizeEmailDigest(body, store.emailDigest || {}, user.email);
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/email-digest/test") {
       await runEmailDigestForUser(user, { test: true });
-      sendJson(res, 200, getState(user));
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/resume") {
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       const body = await parseBody(req);
       store.resumeText = String(body.resumeText || "");
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/resume/upload") {
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       const file = parseMultipartFile(await readRequestBuffer(req), req.headers["content-type"] || "", "resumeFile");
       const resumeText = await extractResumeText(file);
       if (!resumeText) {
@@ -4992,9 +4965,9 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       store.resumeText = resumeText;
-      writeStore(user.id, store);
+      await writeStore(user.id, store);
       sendJson(res, 200, {
-        ...getState(user),
+        ...await getState(user),
         resumeUpload: {
           filename: file.filename,
           characters: resumeText.length
@@ -5004,9 +4977,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/companies") {
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       const body = await parseBody(req);
-      const catalogCompany = findCatalogCompany(body);
+      const catalogCompany = await findCatalogCompany(body);
       if (!catalogCompany) {
         sendJson(res, 400, { error: "Select an available company. Request a new company if it is not listed." });
         return;
@@ -5014,14 +4987,14 @@ const server = http.createServer(async (req, res) => {
       if (!store.targetCompanies.some((company) => company.id === catalogCompany.id || companyShareKey(company) === companyShareKey(catalogCompany))) {
         store.targetCompanies.push(sharedCompanyBase(catalogCompany));
       }
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname.startsWith("/api/companies/") && url.pathname.endsWith("/reset")) {
       const id = decodeURIComponent(url.pathname.replace("/api/companies/", "").replace("/reset", ""));
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       const company = store.targetCompanies.find((item) => item.id === id);
       if (!company) {
         sendJson(res, 404, { error: "Company not found." });
@@ -5039,15 +5012,15 @@ const server = http.createServer(async (req, res) => {
         ? { ...item, lastFoundCount: 0, lastError: null }
         : item);
       store.lastScrapeSummary = summarizeCurrentCompanyJobs(store);
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname.startsWith("/api/companies/") && url.pathname.endsWith("/scan")) {
       const id = decodeURIComponent(url.pathname.replace("/api/companies/", "").replace("/scan", ""));
-      assertCanScan(user.id);
-      const store = readStore(user.id);
+      await assertCanScan(user.id);
+      const store = await readStore(user.id);
       const company = store.targetCompanies.find((item) => item.id === id);
       if (!company) {
         sendJson(res, 404, { error: "Company not found." });
@@ -5055,38 +5028,38 @@ const server = http.createServer(async (req, res) => {
       }
 
       const result = await scrapeJobs(store.profile, [company], store.jobFeedback || {}, store.companyScanJobs || [], "single company", store.resumeText || "", store.jobDetailCache || {}, user.id);
-      recordUsage(user.id, "scan", 1);
-      recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+      await recordUsage(user.id, "scan", 1);
+      await recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
       applyScanResultToStore(store, result);
       addScanRun(store, result.scanRun);
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "DELETE" && url.pathname.startsWith("/api/companies/")) {
       const id = decodeURIComponent(url.pathname.replace("/api/companies/", ""));
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       const company = store.targetCompanies.find((item) => item.id === id);
       store.targetCompanies = store.targetCompanies.filter((item) => item.id !== id);
       store.companyScanJobs = (store.companyScanJobs || []).filter((job) => job.companyId !== id && job.company !== company?.name);
       store.jobs = store.companyScanJobs;
       store.lastScrapeSummary = summarizeCurrentCompanyJobs(store);
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/scrape") {
-      assertCanScan(user.id);
-      const store = readStore(user.id);
+      await assertCanScan(user.id);
+      const store = await readStore(user.id);
       const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "manual all", store.resumeText || "", store.jobDetailCache || {}, user.id);
-      recordUsage(user.id, "scan", 1);
-      recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+      await recordUsage(user.id, "scan", 1);
+      await recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
       applyScanResultToStore(store, result);
       addScanRun(store, result.scanRun);
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 
@@ -5094,7 +5067,7 @@ const server = http.createServer(async (req, res) => {
       const isFeedbackRoute = url.pathname.endsWith("/feedback");
       const isViewedRoute = url.pathname.endsWith("/viewed");
       const id = decodeURIComponent(url.pathname.replace("/api/jobs/", "").replace(/\/(feedback|viewed)$/, ""));
-      const store = readStore(user.id);
+      const store = await readStore(user.id);
       const body = isViewedRoute ? {} : await parseBody(req);
       store.statuses = store.statuses || {};
       if (isViewedRoute) {
@@ -5104,8 +5077,8 @@ const server = http.createServer(async (req, res) => {
           ...existingStatus,
           viewedAt
         };
-        writeStore(user.id, store);
-        sendJson(res, 200, getState(user));
+        await writeStore(user.id, store);
+        sendJson(res, 200, await getState(user));
         return;
       }
       if (isFeedbackRoute) {
@@ -5136,8 +5109,8 @@ const server = http.createServer(async (req, res) => {
         }
         store.companyScanJobs = annotateJobs(store.companyScanJobs || [], store.profile, store.jobFeedback || {});
         store.jobs = store.companyScanJobs;
-        writeStore(user.id, store);
-        sendJson(res, 200, getState(user));
+        await writeStore(user.id, store);
+        sendJson(res, 200, await getState(user));
         return;
       }
       const nextStatus = body.status || "new";
@@ -5165,8 +5138,8 @@ const server = http.createServer(async (req, res) => {
       if (nextStatus === "new") delete nextEntry.status;
       if (nextEntry.status || nextEntry.viewedAt || nextEntry.notes) store.statuses[id] = nextEntry;
       else delete store.statuses[id];
-      writeStore(user.id, store);
-      sendJson(res, 200, getState(user));
+      await writeStore(user.id, store);
+      sendJson(res, 200, await getState(user));
       return;
     }
 

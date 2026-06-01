@@ -1,6 +1,6 @@
 # AI Job Tracker - App Context and Design Decisions
 
-Last updated: May 28, 2026
+Last updated: May 31, 2026
 
 This document is the durable product and engineering reference for the AI Job Tracker app. It explains what the app does, how the major workflows work, why key design decisions were made, and what tradeoffs are currently accepted.
 
@@ -26,11 +26,11 @@ The app intentionally focuses on specific companies instead of searching the ent
 
 - Runtime: Node.js, native `http` server.
 - Frontend: static HTML/CSS/JavaScript under `public/`.
-- Storage: SQLite via Node's `node:sqlite` `DatabaseSync`.
+- Storage: Supabase Postgres through `DATABASE_URL`.
 - LLM provider: OpenAI Responses API.
 - Email provider: Resend.
-- Local default host: `http://127.0.0.1:4173`.
-- Public access option: Cloudflare Tunnel can route a domain to the local server.
+- Local default host: `http://127.0.0.1:4173`, using the Supabase dev project.
+- Public hosting: Render runs the Node service against the Supabase prod project.
 
 ### Why keep this simple stack instead of React and a backend framework?
 
@@ -42,7 +42,7 @@ Tradeoffs:
   - Very low dependency surface.
   - Easy local startup with `npm start`.
   - Fewer moving parts while scanner and parser logic is evolving quickly.
-  - Easier to deploy locally behind Cloudflare Tunnel.
+  - Easy to deploy as one Render web service.
 - Cons:
   - `public/app.js` and `server.js` are large.
   - UI state management is manual.
@@ -78,7 +78,8 @@ Company pages often need site-specific extraction rules. Letting users add arbit
 
 ## 4. Data Storage
 
-The app uses `data/app.db` for persistent state.
+The app uses Supabase Postgres for persistent state. Local development and
+production should use separate Supabase projects.
 
 Main database tables:
 
@@ -91,7 +92,7 @@ Main database tables:
 - `company_requests`: user requests for new companies.
 - `email_digest_sends`: sent job records used to avoid emailing the same job again.
 
-Per-user app state is stored as JSON in `user_stores.data`. It includes:
+Per-user app state is stored as JSONB in `user_stores.data`. It includes:
 
 - `profile`
 - `resumeText`
@@ -106,9 +107,10 @@ Per-user app state is stored as JSON in `user_stores.data`. It includes:
 - `lastScrapeSummary`
 - `scanRuns`
 
-### Why store user app state as JSON inside SQLite?
+### Why keep user app state as JSONB inside Postgres?
 
-Current decision: relational tables for account/global/shared concerns; JSON for evolving per-user dashboard state.
+Current decision: relational tables for account/global/shared concerns; JSONB
+for evolving per-user dashboard state.
 
 Tradeoffs:
 
@@ -121,7 +123,8 @@ Tradeoffs:
   - Harder to enforce field-level constraints.
   - Future analytics may require normalization.
 
-This is acceptable for a small private app. If usage grows, `companyScanJobs`, `statuses`, and `jobDetailCache` are candidates for normalized tables.
+This is acceptable for a small private app. If usage grows, `companyScanJobs`,
+`statuses`, and `jobDetailCache` are candidates for normalized tables.
 
 ## 5. Authentication and Account Safety
 
@@ -706,21 +709,23 @@ The latest UI direction is a bluish operational dashboard:
 
 This is a work tool used repeatedly. Dense, scannable, low-distraction UI is more appropriate than a landing-page or decorative design.
 
-## 22. Public Access and Cloudflare Tunnel
+## 22. Public Access and Render
 
-Cloudflare Tunnel can expose the local app at a domain such as `ai-job-tracker.com`.
+The hosted app runs as a Render Node web service. Supabase Postgres stores
+persistent app data.
 
 Important operational fact:
 
-- Cloudflare does not host the app.
-- Cloudflare routes traffic to the local machine running `npm start`.
-- The app must remain running locally for the domain to work.
+- Render hosts the Node process and serves the static frontend.
+- Render must use `HOST=0.0.0.0` and the Render-provided `PORT`.
+- Render production should use the Supabase prod project.
+- Local development should use the Supabase dev project.
 
-### Why Cloudflare Tunnel?
+### Why Render + Supabase?
 
-It avoids opening router ports and gives HTTPS/domain access quickly.
-
-Tradeoff: availability depends on the local machine and tunnel process. For production reliability, move the app to a hosted server with managed process supervision.
+It removes the dependency on a personal Mac staying awake and gives the app a
+managed server plus managed database. The tradeoff is more environment and
+migration discipline.
 
 ## 23. Environment Variables
 
@@ -728,7 +733,9 @@ Common environment variables:
 
 ```text
 PORT=4173
-HOST=127.0.0.1
+HOST=0.0.0.0
+DATABASE_URL=...
+DATABASE_SSL=require
 SESSION_DAYS=14
 DAILY_SCAN_LIMIT=20
 DAILY_LLM_LIMIT=
@@ -753,6 +760,7 @@ Auth:
 
 State:
 
+- `GET /api/health`
 - `GET /api/state`
 - `GET /api/scanner`
 - `GET /api/llm-status`
@@ -848,13 +856,15 @@ Sent history needs a durable uniqueness constraint per user/job. Storing it in `
 
 Raw parser/API logs are useful to admins but overwhelming to users. Sanitizing `/api/scanner` also prevents internals from being exposed through network inspection.
 
-### Why keep data local?
+### Why keep admin-controlled users instead of public signup?
 
-The current app is designed for a small private group and uses the owner's API keys. Local storage is simple and avoids operating a full production backend. If the app becomes public or commercial, move to hosted infrastructure and per-user billing/auth controls.
+The app still uses the owner's OpenAI and Resend credentials. Admin-created
+accounts avoid uncontrolled API/email usage while allowing friends to use the
+hosted app independently.
 
 ## 26. Current Known Limitations
 
-- App availability depends on the local server and Cloudflare Tunnel if hosted from a personal machine.
+- App availability depends on Render web service uptime and Supabase database availability.
 - Parser health depends on external company websites that can change without notice.
 - Some company pages do not expose reliable posted dates.
 - PDF resume extraction is not implemented.
@@ -893,6 +903,7 @@ Do not commit:
 - `data/*.db-wal`
 - `data/*.db-shm`
 - `data/admin-login.txt`
+- Supabase connection strings
 - API keys
 - passwords
 - user databases
