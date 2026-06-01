@@ -1416,6 +1416,7 @@ function postedDateFilterMessage() {
 function externalJobIdentity(job) {
   const url = String(job.url || "");
   const patterns = [
+    /\/applications\/jobs\/results\/([^/?#]+)/i,
     /\/careers\/job\/([^/?#]+)/i,
     /\/job_details\/([^/?#]+)/i,
     /\/jobs\/([^/?#]+)/i,
@@ -1532,6 +1533,42 @@ function writeJobDetailCacheEntry(cache, key, job, postingContent, result, scori
     matchedSignals: result.matchedSignals || [],
     scoringInputHash,
     fetchedAt: new Date().toISOString(),
+    usedAt: new Date().toISOString()
+  };
+}
+
+function writeExtractedJobDetailCacheEntry(cache, key, job, postingContent, result, error = null) {
+  if (!cache || !key || !postingContent) return;
+  const existing = cache[key] || {};
+  cache[key] = {
+    ...existing,
+    key,
+    companyId: job.companyId,
+    company: job.company,
+    jobIdentity: externalJobIdentity(job),
+    title: job.title,
+    location: job.location || "",
+    url: job.url,
+    postedAt: parseJobDate(job.postedAt) || job.postedAt || null,
+    tags: Array.isArray(job.tags) ? job.tags : [],
+    postingContent,
+    summary: result.summary,
+    summarySource: result.source,
+    relevanceScore: existing.relevanceScore ?? result.relevanceScore,
+    roleRelevanceScore: existing.roleRelevanceScore ?? result.roleRelevanceScore ?? result.relevanceScore,
+    scoreRange: existing.scoreRange || result.scoreRange || null,
+    confidence: existing.confidence || result.confidence || null,
+    locationMatchesProfile: result.locationMatchesProfile || existing.locationMatchesProfile || null,
+    locationStatus: result.locationStatus || existing.locationStatus || "",
+    listingLocation: result.listingLocation || existing.listingLocation || job.listingLocation || job.location || "",
+    detailLocation: result.detailLocation || existing.detailLocation || detailLocationFromPostingContent(postingContent),
+    relevanceBucket: existing.relevanceBucket || normalizeRelevanceBucket(result.relevanceBucket, result.relevanceScore),
+    fitReasons: existing.fitReasons || result.fitReasons || [],
+    concerns: existing.concerns || result.concerns || [],
+    matchedSignals: existing.matchedSignals || result.matchedSignals || [],
+    scoringInputHash: existing.scoringInputHash || "",
+    lastLlmError: error ? cleanText(error.message || error).slice(0, 240) : existing.lastLlmError || "",
+    fetchedAt: existing.fetchedAt || new Date().toISOString(),
     usedAt: new Date().toISOString()
   };
 }
@@ -2329,6 +2366,28 @@ function postingOnlySummaryFromContent(postingContent, job) {
   return cleanText(summary).slice(0, 900) || cleanText(`${job.title}. ${job.description || ""}`).slice(0, 900);
 }
 
+function extractedSummaryResult(job, postingContent, profile) {
+  const detailLocation = detailLocationFromPostingContent(postingContent);
+  const location = resolveJobLocationStatus(job, profile, detailLocation);
+  const summary = postingOnlySummaryFromContent(postingContent, job);
+  return {
+    summary: summary || cleanText(job.description || postingContent).slice(0, 900),
+    source: "extracted",
+    relevanceScore: null,
+    roleRelevanceScore: null,
+    scoreRange: null,
+    confidence: "Low",
+    locationMatchesProfile: hasProfileLocationFilter(profile) ? (location.matchesProfile ? "Yes" : "No") : "Yes",
+    locationStatus: location.status,
+    listingLocation: location.listingLocation,
+    detailLocation,
+    relevanceBucket: null,
+    fitReasons: [],
+    concerns: [],
+    matchedSignals: []
+  };
+}
+
 function summaryMentionsCandidate(summary) {
   return /\b(candidate|profile|resume|target title|target role|fit for|matches the candidate|does not match|diverges from|data\/analytics-oriented)\b/i.test(summary);
 }
@@ -2338,7 +2397,7 @@ async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, 
   const location = resolveJobLocationStatus(job, profile, detailLocation);
   if (!OPENAI_API_KEY || !postingContent) {
     return {
-      summary: postingContent,
+      ...extractedSummaryResult(job, postingContent, profile),
       source: "extracted",
       locationMatchesProfile: location.matchesProfile ? "Yes" : "No",
       locationStatus: location.status,
@@ -2584,9 +2643,30 @@ async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJob
       status: "ok",
       message: "Reused posting detail; refreshed personalized score"
     });
-    const refreshed = await summarizeWithLLM(job, cached.postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog);
-    writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, cached.postingContent, refreshed, scoringInputHash);
-    return refreshed;
+    try {
+      const refreshed = await summarizeWithLLM(job, cached.postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog);
+      writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, cached.postingContent, refreshed, scoringInputHash);
+      return refreshed;
+    } catch (error) {
+      if (cached.summary) {
+        recordScanCall(scanRun, companyLog, {
+          type: "summary fallback",
+          target: job.title,
+          status: "ok",
+          message: "Used cached summary after LLM refresh failed"
+        });
+        return cachedSummaryResult(cached);
+      }
+      const fallback = extractedSummaryResult(job, cached.postingContent, profile);
+      writeExtractedJobDetailCacheEntry(jobDetailCache, cacheKey, job, cached.postingContent, fallback, error);
+      recordScanCall(scanRun, companyLog, {
+        type: "summary fallback",
+        target: job.title,
+        status: "ok",
+        message: "Used posting text after LLM refresh failed"
+      });
+      return fallback;
+    }
   }
 
   let postingContent = job.description;
@@ -2663,9 +2743,21 @@ async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJob
     }
   }
 
-  const result = await summarizeWithLLM(job, postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog);
-  writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, postingContent, result, scoringInputHash);
-  return result;
+  try {
+    const result = await summarizeWithLLM(job, postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog);
+    writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, postingContent, result, scoringInputHash);
+    return result;
+  } catch (error) {
+    const fallback = extractedSummaryResult(job, postingContent, profile);
+    writeExtractedJobDetailCacheEntry(jobDetailCache, cacheKey, job, postingContent, fallback, error);
+    recordScanCall(scanRun, companyLog, {
+      type: "summary fallback",
+      target: job.title,
+      status: "ok",
+      message: "Used posting text after LLM summary failed"
+    });
+    return fallback;
+  }
 }
 
 async function enrichJobSummaries(jobs, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null, jobDetailCache = {}) {
@@ -2971,7 +3063,7 @@ function extractOpenAICareersJobs(html, company, profile) {
       company: company.name,
       location: cleanText(location),
       url: cleanUrl,
-      postedAt: new Date().toISOString(),
+      postedAt: "",
       tags: ["Company watchlist", cleanText(team)].filter(Boolean),
       description: `Found on OpenAI careers. ${team ? `Team: ${cleanText(team)}.` : ""} ${company.notes || ""}`.trim()
     });
@@ -3616,7 +3708,7 @@ function extractGoogleCareersJobs(html, company, profile) {
       company: company.name,
       location: locations.join(", ") || "Google Careers",
       url,
-      postedAt: new Date().toISOString(),
+      postedAt: "",
       tags: ["Company watchlist"],
       description: `Google Careers listing. ${locations.slice(0, 4).join(", ")}`.trim()
     });
@@ -4312,11 +4404,14 @@ function digestJobPreview(job) {
     title: job.title || "",
     url: job.url || "",
     location: job.location || "",
+    description: cleanText(job.description || "").slice(0, 500),
+    summarySource: job.summarySource || "",
     relevanceScore: clampRelevanceScore(job.relevanceScore),
     roleRelevanceScore: clampRelevanceScore(job.roleRelevanceScore ?? job.relevanceScore),
     relevanceBucket: normalizeRelevanceBucket(job.relevanceBucket, job.relevanceScore),
     locationStatus: job.locationStatus || "",
-    postedAt: job.postedAt || ""
+    postedAt: job.postedAt || "",
+    fitReasons: (job.fitReasons || []).slice(0, 3)
   };
 }
 

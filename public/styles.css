@@ -1007,6 +1007,13 @@ details.scanner-run-card {
   line-height: 1.4;
 }
 
+.scanner-email-job p {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .scanner-company-row,
 .scanner-company-card {
   border: 1px solid var(--line);

@@ -460,7 +460,7 @@ function renderScannerEmailDigest(run) {
   for (const job of emailDigest.jobs || []) {
     const item = document.createElement("article");
     item.className = "scanner-email-job";
-    item.innerHTML = `<a target="_blank" rel="noreferrer"></a><span></span>`;
+    item.innerHTML = `<a target="_blank" rel="noreferrer"></a><span></span><p></p>`;
     item.querySelector("a").href = job.url || "#";
     item.querySelector("a").textContent = `${job.company || "Company"} · ${job.title || "Untitled job"}`;
     item.querySelector("span").textContent = [
@@ -468,6 +468,7 @@ function renderScannerEmailDigest(run) {
       Number.isFinite(Number(job.relevanceScore)) ? `${normalizeRelevanceBucket(job.relevanceBucket, job.relevanceScore)} · ${Number(job.relevanceScore)}/10 relevance` : normalizeRelevanceBucket(job.relevanceBucket),
       job.postedAt ? `Posted ${dateLabel(job.postedAt)}` : ""
     ].filter(Boolean).join(" · ");
+    item.querySelector("p").textContent = job.description || "";
     list.append(item);
   }
   return wrap;
