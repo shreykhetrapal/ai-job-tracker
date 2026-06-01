@@ -10,13 +10,21 @@ services:
       - key: HOST
         value: 0.0.0.0
       - key: NODE_VERSION
-        value: 24.14.1
+        value: 22.20.0
       - key: DATABASE_URL
         sync: false
       - key: DATABASE_SSL
         value: require
       - key: DATABASE_POOL_MAX
         value: "8"
+      - key: DATABASE_CONNECT_TIMEOUT_MS
+        value: "10000"
+      - key: DATABASE_IDLE_TIMEOUT_MS
+        value: "30000"
+      - key: DATABASE_QUERY_TIMEOUT_MS
+        value: "15000"
+      - key: DATABASE_STATEMENT_TIMEOUT_MS
+        value: "15000"
       - key: PUBLIC_APP_URL
         sync: false
       - key: OPENAI_API_KEY

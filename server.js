@@ -17,6 +17,10 @@ const HOST = process.env.HOST || "127.0.0.1";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.DATABASE_SSL || "require";
 const DATABASE_POOL_MAX = Number(process.env.DATABASE_POOL_MAX || 8);
+const DATABASE_CONNECT_TIMEOUT_MS = Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 10000);
+const DATABASE_IDLE_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_TIMEOUT_MS || 30000);
+const DATABASE_QUERY_TIMEOUT_MS = Number(process.env.DATABASE_QUERY_TIMEOUT_MS || 15000);
+const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS || 15000);
 const DATA_DIR = path.join(__dirname, "data");
 const STORE_PATH = path.join(DATA_DIR, "store.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -241,7 +245,23 @@ const { Pool } = pg;
 const db = new Pool({
   connectionString: DATABASE_URL,
   max: Number.isFinite(DATABASE_POOL_MAX) && DATABASE_POOL_MAX > 0 ? DATABASE_POOL_MAX : 8,
-  ssl: DATABASE_SSL === "disable" ? false : { rejectUnauthorized: false }
+  ssl: DATABASE_SSL === "disable" ? false : { rejectUnauthorized: false },
+  connectionTimeoutMillis: Number.isFinite(DATABASE_CONNECT_TIMEOUT_MS) && DATABASE_CONNECT_TIMEOUT_MS > 0
+    ? DATABASE_CONNECT_TIMEOUT_MS
+    : 10000,
+  idleTimeoutMillis: Number.isFinite(DATABASE_IDLE_TIMEOUT_MS) && DATABASE_IDLE_TIMEOUT_MS > 0
+    ? DATABASE_IDLE_TIMEOUT_MS
+    : 30000,
+  query_timeout: Number.isFinite(DATABASE_QUERY_TIMEOUT_MS) && DATABASE_QUERY_TIMEOUT_MS > 0
+    ? DATABASE_QUERY_TIMEOUT_MS
+    : 15000,
+  statement_timeout: Number.isFinite(DATABASE_STATEMENT_TIMEOUT_MS) && DATABASE_STATEMENT_TIMEOUT_MS > 0
+    ? DATABASE_STATEMENT_TIMEOUT_MS
+    : 15000
+});
+
+db.on("error", (error) => {
+  console.error("Database pool error:", error.message);
 });
 
 function toPostgresSql(sql) {
