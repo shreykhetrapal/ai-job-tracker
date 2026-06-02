@@ -19,8 +19,8 @@ const DATABASE_SSL = process.env.DATABASE_SSL || "require";
 const DATABASE_POOL_MAX = Number(process.env.DATABASE_POOL_MAX || 8);
 const DATABASE_CONNECT_TIMEOUT_MS = Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 60000);
 const DATABASE_IDLE_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_TIMEOUT_MS || 30000);
-const DATABASE_QUERY_TIMEOUT_MS = Number(process.env.DATABASE_QUERY_TIMEOUT_MS || 15000);
-const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS || 15000);
+const DATABASE_QUERY_TIMEOUT_MS = Number(process.env.DATABASE_QUERY_TIMEOUT_MS || 60000);
+const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS || 60000);
 const DATABASE_STARTUP_RETRIES = Number(process.env.DATABASE_STARTUP_RETRIES || 5);
 const DATABASE_STARTUP_RETRY_DELAY_MS = Number(process.env.DATABASE_STARTUP_RETRY_DELAY_MS || 5000);
 const BACKGROUND_JOBS_FIRST_RUN_DELAY_MS = Number(process.env.BACKGROUND_JOBS_FIRST_RUN_DELAY_MS || 180000);
@@ -259,10 +259,10 @@ const db = new Pool({
     : 30000,
   query_timeout: Number.isFinite(DATABASE_QUERY_TIMEOUT_MS) && DATABASE_QUERY_TIMEOUT_MS > 0
     ? DATABASE_QUERY_TIMEOUT_MS
-    : 15000,
+    : 60000,
   statement_timeout: Number.isFinite(DATABASE_STATEMENT_TIMEOUT_MS) && DATABASE_STATEMENT_TIMEOUT_MS > 0
     ? DATABASE_STATEMENT_TIMEOUT_MS
-    : 15000
+    : 60000
 });
 
 db.on("error", (error) => {
@@ -717,6 +717,25 @@ async function readStore(userId) {
   }
   const data = typeof row.data === "string" ? JSON.parse(row.data) : row.data;
   return normalizeStore({ ...structuredClone(defaultStore), ...data });
+}
+
+async function readDashboardStore(userId) {
+  const row = await dbGet("SELECT data - 'jobDetailCache' - 'scanRuns' AS data FROM user_stores WHERE user_id = ?", [userId]);
+  if (!row) {
+    await writeStore(userId, structuredClone(defaultStore));
+    return { store: structuredClone(defaultStore), jobDetailCacheEntries: null };
+  }
+  const data = typeof row.data === "string" ? JSON.parse(row.data) : row.data;
+  return {
+    store: normalizeStore({ ...structuredClone(defaultStore), ...data, jobDetailCache: {}, scanRuns: [] }),
+    jobDetailCacheEntries: null
+  };
+}
+
+async function readScannerRuns(userId) {
+  const row = await dbGet("SELECT COALESCE(data->'scanRuns', '[]'::jsonb) AS scan_runs FROM user_stores WHERE user_id = ?", [userId]);
+  const scanRuns = typeof row?.scan_runs === "string" ? parseJsonField(row.scan_runs) : row?.scan_runs;
+  return Array.isArray(scanRuns) ? scanRuns : [];
 }
 
 async function writeStore(userId, store) {
@@ -1421,18 +1440,18 @@ async function listFailedScanRunsForAdmin() {
 }
 
 async function getScannerState(user) {
-  const store = await readStore(user.id);
+  const scanRuns = await readScannerRuns(user.id);
   const activeRuns = [...activeScanRuns.values()].filter((run) => run.userId === user.id);
   if (!user.isAdmin) {
     return {
       activeScanRuns: sanitizeScannerRuns(activeRuns),
-      scanRuns: sanitizeScannerRuns(store.scanRuns || [])
+      scanRuns: sanitizeScannerRuns(scanRuns)
     };
   }
   return {
     activeScanRuns: activeRuns,
-    scanRuns: store.scanRuns || [],
-    failedScanRuns: await listFailedScanRunsForAdmin()
+    scanRuns,
+    failedScanRuns: await safeDashboardValue("failed scan runs", [], () => listFailedScanRunsForAdmin())
   };
 }
 
@@ -4625,9 +4644,18 @@ function resumeRecommendations(profile, resumeText, jobs) {
   return recommendations;
 }
 
+async function safeDashboardValue(label, fallback, loader) {
+  try {
+    return await loader();
+  } catch (error) {
+    console.warn(`Dashboard ${label} unavailable: ${error.message}`);
+    return fallback;
+  }
+}
+
 async function getState(user) {
-  const store = await readStore(user.id);
-  const repairedJobs = repairCandidateCentricSummaries(store.companyScanJobs || [], store.jobDetailCache || {});
+  const { store, jobDetailCacheEntries } = await readDashboardStore(user.id);
+  const repairedJobs = repairCandidateCentricSummaries(store.companyScanJobs || [], {});
   const companyScanJobs = annotateJobs(repairedJobs, store.profile, store.jobFeedback || {});
   const {
     jobDetailCache,
@@ -4637,7 +4665,19 @@ async function getState(user) {
     scanRuns,
     ...publicStore
   } = store;
-  const publicScanRuns = user.isAdmin ? (scanRuns || []) : sanitizeScannerRuns(scanRuns || []);
+  const publicScanRuns = sanitizeScannerRuns(scanRuns || []);
+  const [availableCompanies, companyRequests, users, feedbackEntries, usage] = await Promise.all([
+    safeDashboardValue("company catalog", [], () => listCompanyCatalog(user.isAdmin)),
+    safeDashboardValue("company requests", [], () => listCompanyRequests(user)),
+    user.isAdmin ? safeDashboardValue("users", [], () => listUsers()) : Promise.resolve([]),
+    safeDashboardValue("feedback", [], () => listFeedback(user)),
+    safeDashboardValue("usage", {
+      scans: 0,
+      llmCalls: 0,
+      scanLimit: DAILY_SCAN_LIMIT,
+      llmLimit: DAILY_LLM_LIMIT
+    }, () => dailyUsage(user.id))
+  ]);
   return {
     ...publicStore,
     scanRuns: publicScanRuns,
@@ -4645,15 +4685,15 @@ async function getState(user) {
     emailDigest: normalizeEmailDigest(store.emailDigest || {}, store.emailDigest || {}, user.email),
     emailDigestStatus: emailDigestStatus(store),
     currentUser: user,
-    availableCompanies: await listCompanyCatalog(user.isAdmin),
-    companyRequests: await listCompanyRequests(user),
-    users: user.isAdmin ? await listUsers() : [],
-    feedbackEntries: await listFeedback(user),
-    usage: await dailyUsage(user.id),
+    availableCompanies,
+    companyRequests,
+    users,
+    feedbackEntries,
+    usage,
     jobs: companyScanJobs,
     companyScanJobs,
     jobDetailCacheStats: {
-      entries: Object.keys(jobDetailCache || {}).length
+      entries: jobDetailCacheEntries
     },
     recommendations: resumeRecommendations(store.profile, store.resumeText, companyScanJobs)
   };
