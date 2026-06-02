@@ -1279,7 +1279,7 @@ function scanRunIssueCount(scanRun = {}) {
 function scanRunFailureCompanies(scanRun = {}) {
   return (scanRun.companies || []).filter((company) => {
     const callFailures = (company.calls || []).some((call) => call.status === "error");
-    return company.status === "failed" || (company.errors || []).length || callFailures;
+    return company.status === "failed" || (company.errors || []).length || Number(company.llmFailed || 0) > 0 || callFailures;
   });
 }
 
@@ -1389,14 +1389,7 @@ async function listFailedScanRunsForAdmin() {
     SELECT
       users.id AS user_id,
       users.email,
-      runs.scan_run->>'id' AS id,
-      runs.scan_run->>'scope' AS scope,
-      runs.scan_run->>'status' AS status,
-      runs.scan_run->>'startedAt' AS started_at,
-      runs.scan_run->>'finishedAt' AS finished_at,
-      COALESCE(runs.scan_run->'totals', '{}'::jsonb) AS totals,
-      runs.scan_run->'emailDigest' AS email_digest,
-      0 AS failed_company_count
+      runs.scan_run
     FROM user_stores
     JOIN users ON users.id = user_stores.user_id
     CROSS JOIN LATERAL jsonb_array_elements(COALESCE(user_stores.data->'scanRuns', '[]'::jsonb)) AS runs(scan_run)
@@ -1404,30 +1397,26 @@ async function listFailedScanRunsForAdmin() {
       AND (
         runs.scan_run->>'status' = 'failed'
         OR COALESCE((runs.scan_run->'totals'->>'errors')::int, 0) > 0
+        OR COALESCE((runs.scan_run->'totals'->>'llmFailed')::int, 0) > 0
+        OR EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(COALESCE(runs.scan_run->'companies', '[]'::jsonb)) AS companies(company)
+          WHERE companies.company->>'status' = 'failed'
+            OR jsonb_array_length(COALESCE(companies.company->'errors', '[]'::jsonb)) > 0
+            OR COALESCE((companies.company->>'llmFailed')::int, 0) > 0
+            OR EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(COALESCE(companies.company->'calls', '[]'::jsonb)) AS calls(call)
+              WHERE calls.call->>'status' = 'error'
+            )
+        )
       )
     ORDER BY runs.scan_run->>'startedAt' DESC
     LIMIT 80
   `);
   return rows.map((row) => {
-    const totals = typeof row.totals === "string" ? parseJsonField(row.totals) || {} : row.totals || {};
-    const emailDigest = typeof row.email_digest === "string" ? parseJsonField(row.email_digest) : row.email_digest;
-    const failedCompanyCount = Number(row.failed_company_count || 0);
-    return {
-      id: row.id,
-      scope: row.scope,
-      status: row.status,
-      startedAt: row.started_at,
-      finishedAt: row.finished_at,
-      totals,
-      emailDigest: emailDigest ? sanitizeEmailDigestScan(emailDigest) : null,
-      companies: [],
-      userId: row.user_id,
-      userEmail: row.email,
-      failureSummary: {
-        issueCount: Math.max(Number(totals.errors || 0), failedCompanyCount),
-        failedCompanyCount
-      }
-    };
+    const scanRun = typeof row.scan_run === "string" ? parseJsonField(row.scan_run) || {} : row.scan_run || {};
+    return compactFailedScanRunForAdmin(scanRun, row);
   });
 }
 
