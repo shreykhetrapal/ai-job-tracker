@@ -41,6 +41,11 @@ const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
 const DEFAULT_EMAIL_DIGEST_MAX_JOBS = 10;
 const DASHBOARD_URL = process.env.PUBLIC_APP_URL || process.env.APP_URL || "https://ai-job-tracker.com/#jobs";
+const PERSISTED_JOB_LIMIT = Number(process.env.PERSISTED_JOB_LIMIT || 2000);
+const PERSISTED_SCAN_RUN_LIMIT = Number(process.env.PERSISTED_SCAN_RUN_LIMIT || 8);
+const PERSISTED_SCAN_CALL_LIMIT = Number(process.env.PERSISTED_SCAN_CALL_LIMIT || 25);
+const JOB_DETAIL_CACHE_LIMIT = Number(process.env.JOB_DETAIL_CACHE_LIMIT || 250);
+const JOB_DETAIL_CACHE_CONTENT_LIMIT = Number(process.env.JOB_DETAIL_CACHE_CONTENT_LIMIT || 3000);
 const emailPattern = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 const serverStartedAt = new Date().toISOString();
 
@@ -719,15 +724,63 @@ async function readStore(userId) {
   return normalizeStore({ ...structuredClone(defaultStore), ...data });
 }
 
+function dashboardStoreSql() {
+  return `
+    SELECT jsonb_build_object(
+      'profile', COALESCE(data->'profile', '{}'::jsonb),
+      'resumeText', COALESCE(data->'resumeText', '""'::jsonb),
+      'targetCompanies', COALESCE(data->'targetCompanies', '[]'::jsonb),
+      'companyScanJobs', COALESCE(data->'companyScanJobs', '[]'::jsonb),
+      'jobFeedback', COALESCE(data->'jobFeedback', '{}'::jsonb),
+      'statuses', COALESCE(data->'statuses', '{}'::jsonb),
+      'emailDigest', COALESCE(data->'emailDigest', '{}'::jsonb),
+      'lastScrapeAt', COALESCE(data->'lastScrapeAt', 'null'::jsonb),
+      'lastScrapeSummary', COALESCE(data->'lastScrapeSummary', 'null'::jsonb)
+    ) AS data
+    FROM user_stores
+    WHERE user_id = ?
+  `;
+}
+
+function isDatabaseReadTimeout(error) {
+  return /query read timeout|timeout|canceling statement/i.test(String(error?.message || error || ""));
+}
+
+async function compactOversizedUserStore(userId, { dropScanRuns = false } = {}) {
+  const dataExpression = dropScanRuns
+    ? "jsonb_set(data - 'jobDetailCache' - 'jobs' - 'lastGoodCompanyScanJobs', '{scanRuns}', '[]'::jsonb, true)"
+    : "data - 'jobDetailCache' - 'jobs' - 'lastGoodCompanyScanJobs'";
+  await dbRun(`
+    UPDATE user_stores
+    SET data = ${dataExpression}, updated_at = ?
+    WHERE user_id = ?
+  `, [new Date().toISOString(), userId]);
+}
+
 async function readDashboardStore(userId) {
-  const row = await dbGet("SELECT data - 'jobDetailCache' - 'scanRuns' AS data FROM user_stores WHERE user_id = ?", [userId]);
+  let row;
+  try {
+    row = await dbGet(dashboardStoreSql(), [userId]);
+  } catch (error) {
+    if (!isDatabaseReadTimeout(error)) throw error;
+    console.warn(`Dashboard store read timed out for ${userId}; compacting oversized cache fields and retrying.`);
+    await compactOversizedUserStore(userId);
+    try {
+      row = await dbGet(dashboardStoreSql(), [userId]);
+    } catch (retryError) {
+      if (!isDatabaseReadTimeout(retryError)) throw retryError;
+      console.warn(`Dashboard store retry timed out for ${userId}; dropping persisted scanner logs and retrying.`);
+      await compactOversizedUserStore(userId, { dropScanRuns: true });
+      row = await dbGet(dashboardStoreSql(), [userId]);
+    }
+  }
   if (!row) {
     await writeStore(userId, structuredClone(defaultStore));
     return { store: structuredClone(defaultStore), jobDetailCacheEntries: null };
   }
   const data = typeof row.data === "string" ? JSON.parse(row.data) : row.data;
   return {
-    store: normalizeStore({ ...structuredClone(defaultStore), ...data, jobDetailCache: {}, scanRuns: [] }),
+    store: normalizeStore({ ...structuredClone(defaultStore), ...data, jobs: [], jobDetailCache: {}, scanRuns: [] }),
     jobDetailCacheEntries: null
   };
 }
@@ -738,8 +791,86 @@ async function readScannerRuns(userId) {
   return Array.isArray(scanRuns) ? scanRuns : [];
 }
 
-async function writeStore(userId, store) {
+function compactDashboardJob(job = {}) {
+  const compact = {
+    id: job.id,
+    companyId: job.companyId,
+    company: job.company,
+    title: job.title,
+    url: normalizeJobOpenUrl(job),
+    location: job.location || "",
+    listingLocation: job.listingLocation || job.location || "",
+    detailLocation: job.detailLocation || "",
+    locationStatus: job.locationStatus || "",
+    locationMatchesProfile: job.locationMatchesProfile || null,
+    source: job.source || "Company Site",
+    description: cleanText(job.description || "").slice(0, 1600),
+    tags: Array.isArray(job.tags) ? job.tags.slice(0, 12) : [],
+    postedAt: job.postedAt || null,
+    updatedAt: job.updatedAt || null,
+    createdAt: job.createdAt || null,
+    foundAt: job.foundAt || null,
+    relevanceScore: job.relevanceScore ?? null,
+    roleRelevanceScore: job.roleRelevanceScore ?? job.relevanceScore ?? null,
+    manualRelevanceScore: job.manualRelevanceScore ?? null,
+    relevanceBucket: job.relevanceBucket || null,
+    scoreRange: job.scoreRange || null,
+    confidence: job.confidence || null,
+    summarySource: job.summarySource || "",
+    fitReasons: Array.isArray(job.fitReasons) ? job.fitReasons.slice(0, 5) : [],
+    concerns: Array.isArray(job.concerns) ? job.concerns.slice(0, 5) : [],
+    matchedSignals: Array.isArray(job.matchedSignals) ? job.matchedSignals.slice(0, 8) : [],
+    postingContentFetched: Boolean(job.postingContentFetched)
+  };
+  return Object.fromEntries(Object.entries(compact).filter(([, value]) => value !== undefined));
+}
+
+function compactScanRunForPersistence(scanRun = {}) {
+  return {
+    ...scanRun,
+    companies: (scanRun.companies || []).map((company) => ({
+      ...company,
+      calls: (company.calls || []).slice(-PERSISTED_SCAN_CALL_LIMIT),
+      errors: (company.errors || []).slice(-8)
+    }))
+  };
+}
+
+function compactJobDetailCacheForPersistence(cache = {}, activeJobs = []) {
+  const activeKeys = new Set(activeJobs.map(jobDetailCacheKey));
+  return Object.fromEntries(Object.entries(cache || {})
+    .sort(([keyA, a], [keyB, b]) => {
+      const activeDelta = Number(activeKeys.has(keyB)) - Number(activeKeys.has(keyA));
+      if (activeDelta) return activeDelta;
+      return safeDate(b.usedAt || b.fetchedAt) - safeDate(a.usedAt || a.fetchedAt);
+    })
+    .slice(0, JOB_DETAIL_CACHE_LIMIT)
+    .map(([key, entry = {}]) => [key, {
+      ...entry,
+      postingContent: cleanText(entry.postingContent || "").slice(0, JOB_DETAIL_CACHE_CONTENT_LIMIT),
+      fitReasons: Array.isArray(entry.fitReasons) ? entry.fitReasons.slice(0, 5) : [],
+      concerns: Array.isArray(entry.concerns) ? entry.concerns.slice(0, 5) : [],
+      matchedSignals: Array.isArray(entry.matchedSignals) ? entry.matchedSignals.slice(0, 8) : []
+    }]));
+}
+
+function compactStoreForPersistence(store) {
   const normalizedStore = normalizeStore(store);
+  const companyScanJobs = (normalizedStore.companyScanJobs || [])
+    .slice(0, PERSISTED_JOB_LIMIT)
+    .map(compactDashboardJob);
+  normalizedStore.companyScanJobs = companyScanJobs;
+  normalizedStore.jobs = [];
+  normalizedStore.lastGoodCompanyScanJobs = [];
+  normalizedStore.jobDetailCache = compactJobDetailCacheForPersistence(normalizedStore.jobDetailCache || {}, companyScanJobs);
+  normalizedStore.scanRuns = (normalizedStore.scanRuns || [])
+    .slice(0, PERSISTED_SCAN_RUN_LIMIT)
+    .map(compactScanRunForPersistence);
+  return normalizedStore;
+}
+
+async function writeStore(userId, store) {
+  const normalizedStore = compactStoreForPersistence(store);
   await dbRun(`
     INSERT INTO user_stores (user_id, data, updated_at)
     VALUES (?, ?::jsonb, ?)

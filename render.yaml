@@ -33,6 +33,16 @@ services:
         value: "180000"
       - key: BACKGROUND_JOBS_INTERVAL_MS
         value: "3600000"
+      - key: PERSISTED_JOB_LIMIT
+        value: "2000"
+      - key: PERSISTED_SCAN_RUN_LIMIT
+        value: "8"
+      - key: PERSISTED_SCAN_CALL_LIMIT
+        value: "25"
+      - key: JOB_DETAIL_CACHE_LIMIT
+        value: "250"
+      - key: JOB_DETAIL_CACHE_CONTENT_LIMIT
+        value: "3000"
       - key: PUBLIC_APP_URL
         sync: false
       - key: OPENAI_API_KEY
