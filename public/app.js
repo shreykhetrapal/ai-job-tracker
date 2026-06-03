@@ -101,6 +101,8 @@ const els = {
   jobListLastScanned: document.querySelector("#jobListLastScanned"),
   companyJobTable: document.querySelector("#companyJobTable"),
   profileForm: document.querySelector("#profileForm"),
+  profileLocationPresets: document.querySelector("#profileLocationPresets"),
+  unsupportedProfileLocations: document.querySelector("#unsupportedProfileLocations"),
   resumeForm: document.querySelector("#resumeForm"),
   resumeText: document.querySelector("#resumeText"),
   resumeUpload: document.querySelector("#resumeUpload"),
@@ -167,6 +169,16 @@ const viewHeaderMeta = {
     meta: "Share notes that help improve parsers, matching, and the dashboard experience."
   }
 };
+
+const locationPresets = [
+  "Remote US",
+  "United States",
+  "Canada",
+  "United Kingdom",
+  "Europe",
+  "India",
+  "Anywhere / Global"
+];
 
 const commonTimeZones = [
   "America/Los_Angeles",
@@ -565,16 +577,90 @@ function scoreRangeLabel(job) {
   return `${Math.min(low, high)}-${Math.max(low, high)}/10`;
 }
 
-function locationMatchesLabel(job) {
-  if (job.locationStatus === "conflict") {
-    const listing = job.listingLocation || job.location || "listing location";
-    const detail = job.detailLocation || "detail page location";
-    return `Location conflict: listing says ${listing}; detail says ${detail}`;
+function compactLocationValue(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function normalizeProfileLocationsForUi(locations = []) {
+  const rawLocations = Array.isArray(locations) ? locations : String(locations || "").split(/[\n,]/);
+  const selected = new Set();
+  const unsupported = [];
+  const normalizedRaw = rawLocations.map((location) => String(location || "").trim()).filter(Boolean);
+  const hasRemote = normalizedRaw.some((location) => compactLocationValue(location).includes("remote"));
+  const hasUnitedStates = normalizedRaw.some((location) => ["united states", "united states of america", "usa", "us"].includes(compactLocationValue(location)));
+
+  for (const location of normalizedRaw) {
+    const normalized = compactLocationValue(location);
+    const directPreset = locationPresets.find((preset) => compactLocationValue(preset) === normalized);
+    if (directPreset) {
+      selected.add(directPreset);
+      continue;
+    }
+    if (normalized === "remote") {
+      selected.add("Remote US");
+      continue;
+    }
+    if (["united states of america", "usa", "us"].includes(normalized)) {
+      selected.add("United States");
+      continue;
+    }
+    if (normalized === "uk" || normalized === "great britain" || normalized === "britain") {
+      selected.add("United Kingdom");
+      continue;
+    }
+    if (normalized === "global" || normalized === "anywhere") {
+      selected.add("Anywhere / Global");
+      continue;
+    }
+    unsupported.push(location);
   }
-  if (job.locationStatus === "mismatch") return "Location mismatch";
+
+  if (hasRemote && hasUnitedStates) {
+    selected.add("Remote US");
+    selected.add("United States");
+  }
+  return { selected: [...selected], unsupported };
+}
+
+function profileLocationLabel() {
+  const locations = normalizeProfileLocationsForUi(state.profile?.locations || []).selected;
+  return locations.length ? locations.join(", ") : "No profile location set";
+}
+
+function jobLocationLabel(job) {
+  const listing = cleanDisplayLocation(job.listingLocation || job.location);
+  const detail = cleanDisplayLocation(job.detailLocation);
+  if (listing && detail && listing !== detail) return `listing says ${listing}; detail says ${detail}`;
+  if (listing) return `job says ${listing}`;
+  if (detail) return `job says ${detail}`;
+  return "job location not listed";
+}
+
+function cleanDisplayLocation(value) {
+  const raw = String(value || "").trim();
+  const normalized = compactLocationValue(raw);
+  if (!normalized) return "";
+  if (/^(company )?(career|careers|job|jobs)( page| site| board)?$/.test(normalized)) return "";
+  if (/^(apple|netflix|google|openai|meta|microsoft|walmart|ashby|greenhouse|eightfold) (career|careers|jobs|job board|careers board)$/.test(normalized)) return "";
+  if (/^(company|job|careers?) (site|page|board)$/.test(normalized)) return "";
+  return raw;
+}
+
+function locationMatchesLabel(job) {
+  const profileLocation = profileLocationLabel();
+  if (job.locationStatus === "conflict") {
+    const listing = cleanDisplayLocation(job.listingLocation || job.location) || "listing location";
+    const detail = cleanDisplayLocation(job.detailLocation) || "detail page location";
+    return `Location conflict: listing says ${listing}; detail says ${detail}; profile allows ${profileLocation}`;
+  }
+  if (job.locationStatus === "mismatch") return `Location mismatch: ${jobLocationLabel(job)}; profile allows ${profileLocation}`;
   if (job.locationStatus === "unknown") return "Location unknown";
-  if (job.locationMatchesProfile === "Yes") return "Location match: Yes";
-  if (job.locationMatchesProfile === "No") return "Location match: No";
+  if (job.locationMatchesProfile === "Yes") return `Location match: ${jobLocationLabel(job)}; profile allows ${profileLocation}`;
+  if (job.locationMatchesProfile === "No") return `Location mismatch: ${jobLocationLabel(job)}; profile allows ${profileLocation}`;
   return "";
 }
 
@@ -1502,9 +1588,7 @@ function renderSelectedJobDetail(job) {
     statusButton.className = statusFor(job) === nextStatus ? "active" : "";
     if (nextStatus === "shortlisted" && !locationIsEligible(job)) {
       statusButton.disabled = true;
-      statusButton.title = job.locationStatus === "conflict"
-        ? "This job has conflicting location signals, so it cannot be shortlisted yet."
-        : "This job does not match your profile location.";
+      statusButton.title = `${locationMatchesLabel(job) || "This job does not match your profile location."} It cannot be shortlisted yet.`;
     } else {
       statusButton.addEventListener("click", () => setJobStatus(job.id, nextStatus));
     }
@@ -2014,9 +2098,66 @@ function renderProfile() {
   const profile = state.profile || {};
   for (const field of els.profileForm.elements) {
     if (!field.name) continue;
+    if (field.name === "locations") continue;
     const value = profile[field.name];
     field.value = Array.isArray(value) ? value.join("\n") : value || "";
   }
+  const locationState = normalizeProfileLocationsForUi(profile.locations || []);
+  els.profileLocationPresets.replaceChildren();
+  const selectedLocations = new Set(locationState.selected);
+  const dropdown = document.createElement("details");
+  dropdown.className = "location-dropdown";
+  dropdown.innerHTML = `
+    <summary>
+      <span></span>
+      <strong></strong>
+    </summary>
+    <div class="location-dropdown-menu"></div>
+    <div class="location-hidden-inputs"></div>
+  `;
+  const summaryLabel = dropdown.querySelector("summary span");
+  const summaryCount = dropdown.querySelector("summary strong");
+  const menu = dropdown.querySelector(".location-dropdown-menu");
+  const hiddenInputs = dropdown.querySelector(".location-hidden-inputs");
+
+  const syncLocationDropdown = () => {
+    const values = locationPresets.filter((preset) => selectedLocations.has(preset));
+    summaryLabel.textContent = values.length ? values.join(", ") : "Select locations";
+    summaryCount.textContent = values.length ? `${values.length} selected` : "None selected";
+    hiddenInputs.replaceChildren(...values.map((value) => {
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = "locations";
+      input.value = value;
+      return input;
+    }));
+    for (const option of menu.querySelectorAll(".location-dropdown-option")) {
+      const selected = selectedLocations.has(option.dataset.location);
+      option.classList.toggle("selected", selected);
+      option.querySelector("input").checked = selected;
+    }
+  };
+
+  for (const preset of locationPresets) {
+    const option = document.createElement("label");
+    option.className = "location-dropdown-option";
+    option.dataset.location = preset;
+    option.innerHTML = `<input type="checkbox" /><span></span>`;
+    const input = option.querySelector("input");
+    input.value = preset;
+    option.querySelector("span").textContent = preset;
+    input.addEventListener("change", () => {
+      if (input.checked) selectedLocations.add(preset);
+      else selectedLocations.delete(preset);
+      syncLocationDropdown();
+    });
+    menu.append(option);
+  }
+  syncLocationDropdown();
+  els.profileLocationPresets.append(dropdown);
+  els.unsupportedProfileLocations.textContent = locationState.unsupported.length
+    ? `Unsupported old location value${locationState.unsupported.length === 1 ? "" : "s"} ignored until you save: ${locationState.unsupported.join(", ")}`
+    : "";
   els.currentUserEmail.textContent = state.currentUser?.email || "Signed in";
   els.adminPanel.hidden = !state.currentUser?.isAdmin;
   els.userList.replaceChildren();
@@ -2535,7 +2676,9 @@ els.addPresetCompanies.addEventListener("click", addSelectedPresetCompanies);
 
 els.profileForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const data = Object.fromEntries(new FormData(els.profileForm).entries());
+  const formData = new FormData(els.profileForm);
+  const data = Object.fromEntries(formData.entries());
+  data.locations = formData.getAll("locations");
   updateState(await api("/api/profile", {
     method: "POST",
     body: JSON.stringify(data)

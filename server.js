@@ -136,11 +136,44 @@ const defaultProfile = {
   name: "",
   desiredTitles: ["Product Manager", "Software Engineer", "Data Analyst"],
   skills: ["SQL", "Python", "JavaScript", "React", "analytics"],
-  locations: ["Remote", "United States"],
+  locations: ["Remote US", "United States"],
   avoidKeywords: ["unpaid", "commission only"],
   seniority: "",
   notes: ""
 };
+
+const locationPresetValues = [
+  "Remote US",
+  "United States",
+  "Canada",
+  "United Kingdom",
+  "Europe",
+  "India",
+  "Anywhere / Global"
+];
+
+const usStateTokens = new Set([
+  "al", "alabama", "ak", "alaska", "az", "arizona", "ar", "arkansas", "ca", "california",
+  "co", "colorado", "ct", "connecticut", "de", "delaware", "fl", "florida", "ga", "georgia",
+  "hi", "hawaii", "id", "idaho", "il", "illinois", "in", "indiana", "ia", "iowa", "ks", "kansas",
+  "ky", "kentucky", "la", "louisiana", "me", "maine", "md", "maryland", "ma", "massachusetts",
+  "mi", "michigan", "mn", "minnesota", "ms", "mississippi", "mo", "missouri", "mt", "montana",
+  "ne", "nebraska", "nv", "nevada", "nh", "new hampshire", "nj", "new jersey", "nm", "new mexico",
+  "ny", "new york", "nc", "north carolina", "nd", "north dakota", "oh", "ohio", "ok", "oklahoma",
+  "or", "oregon", "pa", "pennsylvania", "ri", "rhode island", "sc", "south carolina",
+  "sd", "south dakota", "tn", "tennessee", "tx", "texas", "ut", "utah", "vt", "vermont",
+  "va", "virginia", "wa", "washington", "wv", "west virginia", "wi", "wisconsin", "wy", "wyoming",
+  "dc", "district of columbia"
+]);
+
+const usCityPhrases = [
+  "culver city", "cupertino", "sunnyvale", "mountain view", "palo alto", "menlo park",
+  "san francisco", "san jose", "santa clara", "los angeles", "seattle", "bellevue",
+  "new york", "austin", "dallas", "houston", "chicago", "boston", "cambridge",
+  "atlanta", "denver", "boulder", "miami", "washington dc", "washington", "portland",
+  "nashville", "raleigh", "durham", "charlotte", "phoenix", "salt lake city",
+  "pittsburgh", "philadelphia", "san diego", "irvine"
+];
 
 const defaultStore = {
   profile: defaultProfile,
@@ -1018,12 +1051,51 @@ function cleanProfileTerm(value) {
   return String(value || "").trim().replace(/^["']+|["']+$/g, "").trim();
 }
 
+function normalizeProfileLocations(input) {
+  const rawLocations = normalizeList(input).map(cleanProfileTerm).filter(Boolean);
+  const selected = new Set();
+  const hasRemote = rawLocations.some((location) => compactLocationText(location).includes("remote"));
+  const hasUnitedStates = rawLocations.some((location) =>
+    ["united states", "united states of america", "usa", "us"].includes(compactLocationText(location))
+  );
+
+  for (const location of rawLocations) {
+    const normalized = compactLocationText(location);
+    const directPreset = locationPresetValues.find((preset) => compactLocationText(preset) === normalized);
+    if (directPreset) {
+      selected.add(directPreset);
+      continue;
+    }
+    if (normalized === "remote") {
+      selected.add("Remote US");
+      continue;
+    }
+    if (["united states of america", "usa", "us"].includes(normalized)) {
+      selected.add("United States");
+      continue;
+    }
+    if (["uk", "great britain", "britain"].includes(normalized)) {
+      selected.add("United Kingdom");
+      continue;
+    }
+    if (["global", "anywhere"].includes(normalized)) {
+      selected.add("Anywhere / Global");
+    }
+  }
+
+  if (hasRemote && hasUnitedStates) {
+    selected.add("Remote US");
+    selected.add("United States");
+  }
+  return [...selected];
+}
+
 function normalizeProfile(input) {
   return {
     name: String(input.name || "").trim(),
     desiredTitles: normalizeList(input.desiredTitles).map(cleanProfileTerm).filter(Boolean),
     skills: normalizeList(input.skills).map(cleanProfileTerm).filter(Boolean),
-    locations: normalizeList(input.locations).map(cleanProfileTerm).filter(Boolean),
+    locations: normalizeProfileLocations(input.locations),
     avoidKeywords: normalizeList(input.avoidKeywords).map(cleanProfileTerm).filter(Boolean),
     seniority: String(input.seniority || "").trim(),
     notes: String(input.notes || "").trim()
@@ -1464,21 +1536,31 @@ function jobScoringInputHash(profile, jobFeedback, resumeText) {
 
 function cachedSummaryResult(entry) {
   const detailLocation = entry.detailLocation || detailLocationFromPostingContent(entry.postingContent || "");
+  const parsed = summaryLooksLikeRawJson(entry.summary)
+    ? extractJsonObject(entry.summary) || partialJsonMatchResult(entry.summary)
+    : null;
+  const parsedSummary = cleanText(parsed?.summary || "");
+  const summary = parsedSummary && !summaryMentionsCandidate(parsedSummary)
+    ? parsedSummary
+    : summaryLooksLikeRawJson(entry.summary) && entry.postingContent
+      ? postingOnlySummaryFromContent(entry.postingContent, entry)
+      : entry.summary;
+  const parsedScore = clampRelevanceScore(parsed?.relevanceScore);
   return {
-    summary: entry.summary,
+    summary,
     source: entry.summarySource || "cache",
-    relevanceScore: entry.relevanceScore,
-    roleRelevanceScore: entry.roleRelevanceScore ?? entry.relevanceScore,
-    scoreRange: entry.scoreRange || null,
-    confidence: entry.confidence || null,
-    locationMatchesProfile: entry.locationMatchesProfile || null,
+    relevanceScore: parsedScore ?? entry.relevanceScore,
+    roleRelevanceScore: parsedScore ?? entry.roleRelevanceScore ?? entry.relevanceScore,
+    scoreRange: parsed?.scoreRange || entry.scoreRange || null,
+    confidence: normalizeConfidence(parsed?.confidence) || entry.confidence || null,
+    locationMatchesProfile: parsed?.locationMatchesProfile || entry.locationMatchesProfile || null,
     locationStatus: entry.locationStatus || "",
     listingLocation: entry.listingLocation || entry.location || "",
     detailLocation,
-    relevanceBucket: normalizeRelevanceBucket(entry.relevanceBucket, entry.relevanceScore),
-    fitReasons: entry.fitReasons || [],
-    concerns: entry.concerns || [],
-    matchedSignals: entry.matchedSignals || [],
+    relevanceBucket: normalizeRelevanceBucket(parsed?.relevanceBucket || entry.relevanceBucket, parsedScore ?? entry.relevanceScore),
+    fitReasons: Array.isArray(parsed?.fitReasons) && parsed.fitReasons.length ? parsed.fitReasons : (entry.fitReasons || []),
+    concerns: Array.isArray(parsed?.concerns) && parsed.concerns.length ? parsed.concerns : (entry.concerns || []),
+    matchedSignals: Array.isArray(parsed?.matchedSignals) && parsed.matchedSignals.length ? parsed.matchedSignals : (entry.matchedSignals || []),
     cached: true
   };
 }
@@ -1495,6 +1577,31 @@ function repairCandidateCentricSummaries(jobs = [], jobDetailCache = {}) {
       detailLocation: job.detailLocation || cacheEntry.detailLocation || detailLocationFromPostingContent(cacheEntry.postingContent || ""),
       locationStatus: job.locationStatus || cacheEntry.locationStatus || ""
     } : job;
+    if (summaryLooksLikeRawJson(backfilled.description)) {
+      const parsed = extractJsonObject(backfilled.description) || partialJsonMatchResult(backfilled.description);
+      const parsedSummary = cleanText(parsed?.summary || "");
+      const repairedDescription = parsedSummary && !summaryMentionsCandidate(parsedSummary)
+        ? parsedSummary
+        : cacheEntry?.postingContent
+          ? postingOnlySummaryFromContent(cacheEntry.postingContent, backfilled)
+          : cleanText(backfilled.title || "Summary unavailable.");
+      const parsedScore = clampRelevanceScore(parsed?.relevanceScore);
+      const roleScore = parsedScore ?? backfilled.roleRelevanceScore ?? backfilled.relevanceScore;
+      return {
+        ...backfilled,
+        description: repairedDescription,
+        summarySource: parsedSummary ? "llm" : "extracted",
+        relevanceScore: parsedScore ?? backfilled.relevanceScore,
+        roleRelevanceScore: roleScore,
+        scoreRange: parsed?.scoreRange || backfilled.scoreRange || null,
+        confidence: normalizeConfidence(parsed?.confidence) || backfilled.confidence || null,
+        locationMatchesProfile: parsed?.locationMatchesProfile || backfilled.locationMatchesProfile || null,
+        relevanceBucket: normalizeRelevanceBucket(parsed?.relevanceBucket || backfilled.relevanceBucket, parsedScore ?? backfilled.relevanceScore),
+        fitReasons: Array.isArray(parsed?.fitReasons) && parsed.fitReasons.length ? parsed.fitReasons : (backfilled.fitReasons || []),
+        concerns: Array.isArray(parsed?.concerns) && parsed.concerns.length ? parsed.concerns : (backfilled.concerns || []),
+        matchedSignals: Array.isArray(parsed?.matchedSignals) && parsed.matchedSignals.length ? parsed.matchedSignals : (backfilled.matchedSignals || [])
+      };
+    }
     if (!summaryMentionsCandidate(backfilled.description) || !cacheEntry?.postingContent) return backfilled;
     return {
       ...backfilled,
@@ -1672,10 +1779,6 @@ function relevanceCapForRoleFamily(job, profile, postingContent = "") {
   return desiredRoleSpecs(profile).some((spec) => spec.domainTokens.length) ? 4 : 6;
 }
 
-function hasProfileLocationFilter(profile) {
-  return normalizeList(profile?.locations).length > 0;
-}
-
 function compactLocationText(value) {
   return cleanText(value)
     .normalize("NFD")
@@ -1685,18 +1788,12 @@ function compactLocationText(value) {
     .trim();
 }
 
-function profileLocationAliases(value) {
-  const normalized = compactLocationText(cleanProfileTerm(value));
-  if (!normalized) return [];
-  const aliases = new Set([normalized]);
-  if (normalized.includes("remote")) aliases.add("remote");
-  if (["united states", "united states of america", "usa", "us"].includes(normalized)) {
-    aliases.add("united states");
-    aliases.add("united states of america");
-    aliases.add("usa");
-    aliases.add("us");
-  }
-  return [...aliases];
+function activeProfileLocations(profile) {
+  return normalizeProfileLocations(profile?.locations || []);
+}
+
+function hasProfileLocationFilter(profile) {
+  return activeProfileLocations(profile).length > 0;
 }
 
 function locationTextIncludesAlias(locationText, alias) {
@@ -1709,16 +1806,60 @@ function locationTextIncludesAlias(locationText, alias) {
   return normalized.includes(compactAlias);
 }
 
-function locationTextMatchesProfile(locationText, profile) {
-  if (!cleanText(locationText)) return null;
-  return normalizeList(profile.locations).some((rawLocation) =>
-    profileLocationAliases(rawLocation).some((alias) => locationTextIncludesAlias(locationText, alias))
+function locationTextIsPlaceholder(locationText) {
+  const normalized = compactLocationText(locationText);
+  if (!normalized) return true;
+  return /^(company )?(career|careers|job|jobs)( page| site| board)?$/.test(normalized) ||
+    /^(apple|netflix|google|openai|meta|microsoft|walmart|ashby|greenhouse|eightfold) (career|careers|jobs|job board|careers board)$/.test(normalized) ||
+    /^(company|job|careers?) (site|page|board)$/.test(normalized);
+}
+
+function locationHasAnyToken(normalizedLocation, values) {
+  return values.some((value) => locationTextIncludesAlias(normalizedLocation, value));
+}
+
+function locationTextIsRemote(normalizedLocation) {
+  return /\b(remote|work from home|wfh|virtual|distributed)\b/.test(normalizedLocation);
+}
+
+function locationTextIsUnitedStates(normalizedLocation) {
+  if (locationHasAnyToken(normalizedLocation, ["united states", "united states of america", "usa", "u s a", "us"])) return true;
+  if (usCityPhrases.some((city) => locationTextIncludesAlias(normalizedLocation, city))) return true;
+  const tokens = normalizedLocation.split(/\s+/).filter(Boolean);
+  const hasStateAbbreviation = tokens.some((token) =>
+    token.length === 2 && usStateTokens.has(token) && !["in", "or", "me"].includes(token)
   );
+  const hasStateName = [...usStateTokens].some((state) =>
+    state.length > 2 && locationTextIncludesAlias(normalizedLocation, state)
+  );
+  return hasStateAbbreviation || hasStateName;
+}
+
+function locationTextMatchesPreset(normalizedLocation, preset) {
+  if (preset === "Anywhere / Global") return true;
+  if (preset === "Remote US") return locationTextIsRemote(normalizedLocation) &&
+    (locationTextIsUnitedStates(normalizedLocation) || !/\b(canada|uk|united kingdom|india|europe)\b/.test(normalizedLocation));
+  if (preset === "United States") return locationTextIsUnitedStates(normalizedLocation);
+  if (preset === "Canada") return locationHasAnyToken(normalizedLocation, ["canada", "toronto", "vancouver", "montreal", "ottawa"]);
+  if (preset === "United Kingdom") return locationHasAnyToken(normalizedLocation, ["united kingdom", "uk", "london", "england", "scotland", "wales"]);
+  if (preset === "Europe") return locationHasAnyToken(normalizedLocation, ["europe", "eu", "germany", "france", "ireland", "netherlands", "spain", "italy", "berlin", "paris", "dublin", "amsterdam"]);
+  if (preset === "India") return locationHasAnyToken(normalizedLocation, ["india", "bengaluru", "bangalore", "hyderabad", "mumbai", "delhi", "pune", "chennai", "gurgaon", "gurugram"]);
+  return false;
+}
+
+function locationTextMatchesProfile(locationText, profile) {
+  if (!cleanText(locationText) || locationTextIsPlaceholder(locationText)) return null;
+  const normalizedLocation = compactLocationText(locationText);
+  const profileLocations = activeProfileLocations(profile);
+  if (!profileLocations.length) return null;
+  return profileLocations.some((preset) => locationTextMatchesPreset(normalizedLocation, preset));
 }
 
 function resolveJobLocationStatus(job, profile, detailLocationOverride = null) {
-  const listingLocation = cleanText(job.listingLocation || job.location || "");
-  const detailLocation = cleanText(detailLocationOverride ?? job.detailLocation ?? "");
+  const rawListingLocation = cleanText(job.listingLocation || job.location || "");
+  const rawDetailLocation = cleanText(detailLocationOverride ?? job.detailLocation ?? "");
+  const listingLocation = locationTextIsPlaceholder(rawListingLocation) ? "" : rawListingLocation;
+  const detailLocation = locationTextIsPlaceholder(rawDetailLocation) ? "" : rawDetailLocation;
   if (!hasProfileLocationFilter(profile)) {
     return { status: "match", matchesProfile: true, listingLocation, detailLocation };
   }
@@ -1863,10 +2004,9 @@ function scoreJob(job, profile, feedbackSignals = { weights: new Map(), exact: n
     if (title.includes(term)) roleSkillScore += 10;
     else if (haystack.includes(term)) roleSkillScore += 7;
   }
-  for (const location of profile.locations) {
-    const term = location.toLowerCase();
-    if (!term) continue;
-    if (job.location.toLowerCase().includes(term) || haystack.includes(term)) locationScore += 10;
+  const jobLocationText = compactLocationText(`${job.location || ""} ${job.listingLocation || ""} ${job.detailLocation || ""} ${job.description || ""}`);
+  for (const location of activeProfileLocations(profile)) {
+    if (locationTextMatchesPreset(jobLocationText, location)) locationScore += 10;
   }
   if (profile.seniority && haystack.includes(profile.seniority.toLowerCase())) contextScore += 8;
 
@@ -2241,6 +2381,69 @@ function extractJsonObject(text) {
   }
 }
 
+function jsonStringField(text, fieldName) {
+  const pattern = new RegExp(`"${fieldName}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"` , "i");
+  const match = String(text || "").match(pattern);
+  if (!match?.[1]) return "";
+  try {
+    return JSON.parse(`"${match[1]}"`);
+  } catch {
+    return match[1].replace(/\\"/g, "\"").replace(/\\n/g, " ");
+  }
+}
+
+function jsonNumberField(text, fieldName) {
+  const pattern = new RegExp(`"${fieldName}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`, "i");
+  const match = String(text || "").match(pattern);
+  if (!match?.[1]) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function jsonObjectNumberField(text, objectName, fieldName) {
+  const objectMatch = String(text || "").match(new RegExp(`"${objectName}"\\s*:\\s*\\{([\\s\\S]*?)(?:\\}|$)`, "i"));
+  if (!objectMatch?.[1]) return null;
+  return jsonNumberField(objectMatch[1], fieldName);
+}
+
+function jsonArrayField(text, fieldName) {
+  const pattern = new RegExp(`"${fieldName}"\\s*:\\s*\\[([\\s\\S]*?)(?:\\]|$)`, "i");
+  const match = String(text || "").match(pattern);
+  if (!match?.[1]) return [];
+  const values = [];
+  const itemPattern = /"((?:\\.|[^"\\])*)"/g;
+  let itemMatch;
+  while ((itemMatch = itemPattern.exec(match[1])) && values.length < 8) {
+    try {
+      values.push(JSON.parse(`"${itemMatch[1]}"`));
+    } catch {
+      values.push(itemMatch[1].replace(/\\"/g, "\"").replace(/\\n/g, " "));
+    }
+  }
+  return values.map(cleanText).filter(Boolean);
+}
+
+function partialJsonMatchResult(text) {
+  const raw = String(text || "");
+  const summary = jsonStringField(raw, "summary");
+  if (!summary && !/^\s*\{/.test(raw)) return null;
+  const scoreRangeLow = jsonObjectNumberField(raw, "scoreRange", "low");
+  const scoreRangeHigh = jsonObjectNumberField(raw, "scoreRange", "high");
+  return {
+    summary,
+    relevanceScore: jsonNumberField(raw, "relevanceScore"),
+    scoreRange: scoreRangeLow !== null || scoreRangeHigh !== null
+      ? { low: scoreRangeLow, high: scoreRangeHigh }
+      : null,
+    confidence: jsonStringField(raw, "confidence"),
+    locationMatchesProfile: jsonStringField(raw, "locationMatchesProfile"),
+    relevanceBucket: jsonStringField(raw, "relevanceBucket"),
+    fitReasons: jsonArrayField(raw, "fitReasons"),
+    concerns: jsonArrayField(raw, "concerns"),
+    matchedSignals: jsonArrayField(raw, "matchedSignals")
+  };
+}
+
 function clampRelevanceScore(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
@@ -2392,6 +2595,11 @@ function summaryMentionsCandidate(summary) {
   return /\b(candidate|profile|resume|target title|target role|fit for|matches the candidate|does not match|diverges from|data\/analytics-oriented)\b/i.test(summary);
 }
 
+function summaryLooksLikeRawJson(summary) {
+  const text = String(summary || "").trim();
+  return /^\{/.test(text) && /"summary"\s*:|"relevanceScore"\s*:/.test(text);
+}
+
 async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null) {
   const detailLocation = detailLocationFromPostingContent(postingContent);
   const location = resolveJobLocationStatus(job, profile, detailLocation);
@@ -2441,7 +2649,7 @@ Detail page location: ${location.detailLocation || "not found"}
 Candidate profile:
 Target titles: ${(profile.desiredTitles || []).join(", ")}
 Skills: ${(profile.skills || []).join(", ")}
-Locations: ${(profile.locations || []).join(", ")}
+Locations: ${activeProfileLocations(profile).join(", ")}
 Seniority: ${profile.seniority || ""}
 Notes: ${profile.notes || ""}
 
@@ -2478,7 +2686,7 @@ Use High only for scores 8-10, Medium for scores 5-7, and Low for scores 0-4. Us
             ]
           }
         ],
-        max_output_tokens: 700
+        max_output_tokens: 1400
       })
     });
   } catch (error) {
@@ -2518,10 +2726,12 @@ Use High only for scores 8-10, Medium for scores 5-7, and Low for scores 0-4. Us
     throw error;
   }
   const text = responseText(data);
-  const parsed = extractJsonObject(text);
+  const parsed = extractJsonObject(text) || partialJsonMatchResult(text);
   const parsedSummary = cleanText(parsed?.summary || text).slice(0, 900);
   const fallbackSummary = postingOnlySummaryFromContent(postingContent, job);
-  const summary = summaryMentionsCandidate(parsedSummary) ? fallbackSummary : (parsedSummary || fallbackSummary);
+  const summary = summaryMentionsCandidate(parsedSummary) || summaryLooksLikeRawJson(parsedSummary)
+    ? fallbackSummary
+    : (parsedSummary || fallbackSummary);
   const rawRelevanceScore = clampRelevanceScore(parsed?.relevanceScore);
   const relevanceCap = relevanceCapForRoleFamily(job, profile, postingContent);
   const relevanceScore = rawRelevanceScore === null ? null : Math.min(rawRelevanceScore, relevanceCap);

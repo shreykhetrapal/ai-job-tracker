@@ -323,10 +323,11 @@
               <span>Skills and keywords</span>
               <textarea name="skills" rows="5"></textarea>
             </label>
-            <label>
-              <span>Locations</span>
-              <textarea name="locations" rows="4"></textarea>
-            </label>
+            <fieldset class="location-preset-field">
+              <legend>Locations</legend>
+              <div class="location-preset-dropdown" id="profileLocationPresets"></div>
+              <p id="unsupportedProfileLocations" class="scan-inline-note"></p>
+            </fieldset>
             <label>
               <span>Words to avoid</span>
               <textarea name="avoidKeywords" rows="4"></textarea>
