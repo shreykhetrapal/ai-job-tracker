@@ -14,6 +14,16 @@ const state = {
   feedbackEntries: [],
   emailDigest: {},
   emailDigestStatus: {},
+  analytics: {
+    rangeDays: 30,
+    totals: null,
+    daily: [],
+    users: [],
+    generatedAt: null,
+    loading: false,
+    error: "",
+    loaded: false
+  },
   recommendations: [],
   lastScrapeAt: null,
   lastScrapeSummary: null,
@@ -117,6 +127,18 @@ const els = {
   emailDigestStatus: document.querySelector("#emailDigestStatus"),
   emailDigestMeta: document.querySelector("#emailDigestMeta"),
   sendTestEmail: document.querySelector("#sendTestEmail"),
+  analyticsActiveUsers: document.querySelector("#analyticsActiveUsers"),
+  analyticsActivityTime: document.querySelector("#analyticsActivityTime"),
+  analyticsScans: document.querySelector("#analyticsScans"),
+  analyticsJobs: document.querySelector("#analyticsJobs"),
+  analyticsLlmCalls: document.querySelector("#analyticsLlmCalls"),
+  analyticsEmails: document.querySelector("#analyticsEmails"),
+  analyticsStatus: document.querySelector("#analyticsStatus"),
+  analyticsGeneratedAt: document.querySelector("#analyticsGeneratedAt"),
+  analyticsDailyChart: document.querySelector("#analyticsDailyChart"),
+  analyticsUserTable: document.querySelector("#analyticsUserTable"),
+  analyticsRangeButtons: document.querySelectorAll("[data-analytics-range]"),
+  refreshAnalytics: document.querySelector("#refreshAnalytics"),
   feedbackForm: document.querySelector("#feedbackForm"),
   feedbackText: document.querySelector("#feedbackText"),
   feedbackCount: document.querySelector("#feedbackCount"),
@@ -132,6 +154,7 @@ const viewTitles = {
   profile: "Your Profile",
   email: "Email Digest",
   scanner: "Scanner",
+  analytics: "Analytics",
   feedback: "Feedback",
 };
 
@@ -163,6 +186,10 @@ const viewHeaderMeta = {
   scanner: {
     eyebrow: "Scan status",
     meta: "Run scans and inspect what was found, matched, cached, or needs attention."
+  },
+  analytics: {
+    eyebrow: "Admin analytics",
+    meta: "Monitor usage, scan volume, LLM calls, saved jobs, and email digest delivery."
   },
   feedback: {
     eyebrow: "Product feedback",
@@ -230,6 +257,7 @@ async function api(path, options = {}) {
 function updateState(next) {
   Object.assign(state, next);
   syncSelections();
+  if (state.currentUser?.id) startActivityHeartbeat();
   render();
 }
 
@@ -256,6 +284,23 @@ function dateTimeLabel(value) {
     hour: "numeric",
     minute: "2-digit"
   }).format(date);
+}
+
+function activeTimeLabel(seconds) {
+  const totalSeconds = Math.max(0, Number(seconds || 0));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.round((totalSeconds % 3600) / 60);
+  if (hours && minutes) return `${hours}h ${minutes}m`;
+  if (hours) return `${hours}h`;
+  return `${minutes}m`;
+}
+
+function isAdminOnlyView(view) {
+  return Boolean(document.querySelector(`.nav-button[data-view="${view}"]`)?.dataset.adminOnly === "true");
+}
+
+function canView(view) {
+  return !isAdminOnlyView(view) || Boolean(state.currentUser?.isAdmin);
 }
 
 function relativeLabel(value) {
@@ -2288,6 +2333,123 @@ function renderEmailDigest() {
   }
 }
 
+function renderAnalytics() {
+  if (!els.analyticsDailyChart) return;
+  const isAdmin = Boolean(state.currentUser?.isAdmin);
+  if (!isAdmin) return;
+
+  const analytics = state.analytics || {};
+  const totals = analytics.totals || {};
+  els.analyticsRangeButtons.forEach((button) => {
+    const active = Number(button.dataset.analyticsRange) === Number(analytics.rangeDays || 30);
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+
+  els.analyticsActiveUsers.textContent = numberLabel(totals.activeUsers || 0);
+  els.analyticsActivityTime.textContent = activeTimeLabel(totals.activeSeconds || 0);
+  els.analyticsScans.textContent = numberLabel(totals.scans || 0);
+  els.analyticsJobs.textContent = `${numberLabel(totals.jobsScanned || 0)} scanned · ${numberLabel(totals.jobsSaved || 0)} saved`;
+  els.analyticsLlmCalls.textContent = numberLabel(totals.llmCalls || 0);
+  els.analyticsEmails.textContent = `${numberLabel(totals.emailsSent || 0)} sent · ${numberLabel(totals.emailJobsSent || 0)} jobs`;
+  els.analyticsStatus.textContent = analytics.loading
+    ? "Loading analytics..."
+    : analytics.error
+      ? `Unable to load analytics: ${analytics.error}`
+      : `Showing the last ${analytics.rangeDays || 30} days.`;
+  els.analyticsGeneratedAt.textContent = analytics.generatedAt ? `Updated ${dateTimeLabel(analytics.generatedAt)}` : "";
+
+  els.analyticsDailyChart.replaceChildren();
+  const dailyRows = analytics.daily || [];
+  if (!dailyRows.length && !analytics.loading) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "No analytics activity yet.";
+    els.analyticsDailyChart.append(empty);
+  } else {
+    const maxDaily = Math.max(1, ...dailyRows.map((day) => (
+      Number(day.jobsScanned || 0) +
+      Number(day.llmCalls || 0) +
+      Number(day.scans || 0) * 10 +
+      Number(day.emailsSent || 0) * 10 +
+      Math.round(Number(day.activeSeconds || 0) / 60)
+    )));
+    for (const day of dailyRows) {
+      const rowTotal =
+        Number(day.jobsScanned || 0) +
+        Number(day.llmCalls || 0) +
+        Number(day.scans || 0) * 10 +
+        Number(day.emailsSent || 0) * 10 +
+        Math.round(Number(day.activeSeconds || 0) / 60);
+      const row = document.createElement("article");
+      row.className = "analytics-day-row";
+      row.innerHTML = `
+        <time></time>
+        <div class="analytics-day-bar"><span></span></div>
+        <p></p>
+      `;
+      row.querySelector("time").textContent = dateLabel(day.date);
+      row.querySelector(".analytics-day-bar span").style.width = `${Math.max(3, Math.round((rowTotal / maxDaily) * 100))}%`;
+      row.querySelector("p").textContent = `${numberLabel(day.scans)} scans · ${numberLabel(day.jobsScanned)} jobs · ${numberLabel(day.llmCalls)} LLM · ${numberLabel(day.emailsSent)} emails · ${activeTimeLabel(day.activeSeconds)}`;
+      els.analyticsDailyChart.append(row);
+    }
+  }
+
+  els.analyticsUserTable.replaceChildren();
+  const users = analytics.users || [];
+  if (!users.length && !analytics.loading) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "No user analytics yet.";
+    els.analyticsUserTable.append(empty);
+    return;
+  }
+
+  const tableWrap = document.createElement("div");
+  tableWrap.className = "table-scroll";
+  const table = document.createElement("table");
+  table.className = "user-table analytics-table";
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Activity</th>
+        <th>Scans / jobs</th>
+        <th>LLM</th>
+        <th>Email</th>
+        <th>Saved data</th>
+        <th>Last scan</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  `;
+  const tbody = table.querySelector("tbody");
+  for (const user of users) {
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td><strong></strong><span></span></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+    `;
+    row.querySelector("strong").textContent = user.email;
+    row.querySelector("span").textContent = `${user.isAdmin ? "Admin" : "User"}${user.disabled ? " · Disabled" : ""}`;
+    const cells = row.querySelectorAll("td");
+    cells[1].textContent = `${activeTimeLabel(user.activeSeconds)}${user.lastSeenAt ? ` · last active ${dateTimeLabel(user.lastSeenAt)}` : ""}`;
+    cells[2].textContent = `${numberLabel(user.scans)} scans · ${numberLabel(user.jobsScanned)} scanned · ${numberLabel(user.jobsSaved)} saved`;
+    cells[3].textContent = `${numberLabel(user.llmCalls)} calls`;
+    cells[4].textContent = `${numberLabel(user.emailsSent)} emails · ${numberLabel(user.emailJobsSent)} jobs sent${user.lastEmailAt ? ` · last ${dateTimeLabel(user.lastEmailAt)}` : ""}`;
+    cells[5].textContent = `${numberLabel(user.currentCompanies)} companies · ${numberLabel(user.currentJobs)} jobs · ${numberLabel(user.scanRuns)} scan logs`;
+    cells[6].textContent = user.lastScanAt ? dateTimeLabel(user.lastScanAt) : "Not scanned";
+    tbody.append(row);
+  }
+  tableWrap.append(table);
+  els.analyticsUserTable.append(tableWrap);
+}
+
 function renderFeedback() {
   if (!els.feedbackList) return;
   const entries = state.feedbackEntries || [];
@@ -2328,8 +2490,24 @@ function renderFeedback() {
 }
 
 function renderView() {
-  els.navButtons.forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
-  els.views.forEach((view) => view.classList.toggle("active", view.id === `${state.view}View`));
+  if (!canView(state.view)) {
+    state.view = "overview";
+  }
+  const isAdmin = Boolean(state.currentUser?.isAdmin);
+  els.navButtons.forEach((button) => {
+    const adminOnly = button.dataset.adminOnly === "true";
+    const visible = isAdmin || !adminOnly;
+    button.hidden = !visible;
+    button.setAttribute("aria-hidden", String(!visible));
+    button.classList.toggle("active", visible && button.dataset.view === state.view);
+  });
+  els.views.forEach((view) => {
+    const adminOnly = view.dataset.adminOnly === "true";
+    const visible = isAdmin || !adminOnly;
+    view.hidden = !visible;
+    view.setAttribute("aria-hidden", String(!visible));
+    view.classList.toggle("active", visible && view.id === `${state.view}View`);
+  });
   els.viewTitle.textContent = viewTitles[state.view];
   const header = viewHeaderMeta[state.view] || viewHeaderMeta.overview;
   els.viewEyebrow.textContent = header.eyebrow;
@@ -2355,7 +2533,85 @@ function render() {
   renderResume();
   renderPipeline();
   renderEmailDigest();
+  renderAnalytics();
   renderFeedback();
+  maybeLoadAnalytics();
+}
+
+async function loadAdminAnalytics({ force = false } = {}) {
+  if (!state.currentUser?.isAdmin || state.analytics.loading) return;
+  if (!force && state.analytics.loaded) return;
+  state.analytics = {
+    ...state.analytics,
+    loading: true,
+    error: ""
+  };
+  renderAnalytics();
+  try {
+    const data = await api(`/api/admin/analytics?range=${encodeURIComponent(state.analytics.rangeDays || 30)}`);
+    state.analytics = {
+      ...state.analytics,
+      ...data,
+      loading: false,
+      error: "",
+      loaded: true
+    };
+  } catch (error) {
+    state.analytics = {
+      ...state.analytics,
+      loading: false,
+      error: error.message,
+      loaded: false
+    };
+  }
+  renderAnalytics();
+}
+
+function maybeLoadAnalytics() {
+  if (state.view !== "analytics" || !state.currentUser?.isAdmin) return;
+  if (!state.analytics.loaded && !state.analytics.loading) {
+    loadAdminAnalytics();
+  }
+}
+
+let activityTimer = null;
+let lastUserActivityAt = Date.now();
+let lastActivitySentAt = Date.now();
+
+function noteUserActivity() {
+  lastUserActivityAt = Date.now();
+}
+
+async function sendActivityHeartbeat() {
+  if (!state.currentUser?.id || document.hidden) {
+    lastActivitySentAt = Date.now();
+    return;
+  }
+  const now = Date.now();
+  if (now - lastUserActivityAt > 2 * 60 * 1000) {
+    lastActivitySentAt = now;
+    return;
+  }
+  const seconds = Math.round((now - lastActivitySentAt) / 1000);
+  lastActivitySentAt = now;
+  if (seconds <= 0) return;
+  try {
+    await fetch(`${apiBase}/api/activity`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seconds }),
+      keepalive: true
+    });
+  } catch {
+    // Activity analytics should never interrupt normal dashboard usage.
+  }
+}
+
+function startActivityHeartbeat() {
+  if (activityTimer) return;
+  lastUserActivityAt = Date.now();
+  lastActivitySentAt = Date.now();
+  activityTimer = setInterval(sendActivityHeartbeat, 60 * 1000);
 }
 
 function clearCompanyRequestForm() {
@@ -2652,6 +2908,23 @@ els.scannerTabButtons.forEach((button) => {
     state.scannerTab = button.dataset.scannerTab || "activity";
     renderScanner();
   });
+});
+
+els.analyticsRangeButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    state.analytics.rangeDays = Number(button.dataset.analyticsRange || 30);
+    state.analytics.loaded = false;
+    loadAdminAnalytics({ force: true });
+  });
+});
+
+els.refreshAnalytics?.addEventListener("click", () => {
+  state.analytics.loaded = false;
+  loadAdminAnalytics({ force: true });
+});
+
+["click", "keydown", "mousemove", "scroll", "touchstart"].forEach((eventName) => {
+  window.addEventListener(eventName, noteUserActivity, { passive: true });
 });
 
 window.addEventListener("hashchange", () => {

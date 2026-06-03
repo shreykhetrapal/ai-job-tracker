@@ -30,6 +30,8 @@ const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
 const DEFAULT_EMAIL_DIGEST_MAX_JOBS = 10;
 const DASHBOARD_URL = process.env.PUBLIC_APP_URL || process.env.APP_URL || "https://ai-job-tracker.com/#jobs";
+const ANALYTICS_RANGE_DAYS = [7, 30, 90];
+const ACTIVITY_HEARTBEAT_MAX_SECONDS = 120;
 const emailPattern = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 
 const jobMatchResponseFormat = {
@@ -1015,6 +1017,76 @@ function totalUsage(userId) {
   };
 }
 
+function analyticsRangeDays(value) {
+  const requested = Number(value || ANALYTICS_RANGE_DAYS[1]);
+  return ANALYTICS_RANGE_DAYS.includes(requested) ? requested : ANALYTICS_RANGE_DAYS[1];
+}
+
+function analyticsSinceIso(rangeDays) {
+  const since = new Date();
+  since.setDate(since.getDate() - Math.max(0, rangeDays - 1));
+  since.setHours(0, 0, 0, 0);
+  return since.toISOString();
+}
+
+function dayKey(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+}
+
+function analyticsDayKeys(rangeDays) {
+  const keys = [];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  for (let offset = rangeDays - 1; offset >= 0; offset -= 1) {
+    const date = new Date(today);
+    date.setDate(today.getDate() - offset);
+    keys.push(dayKey(date));
+  }
+  return keys;
+}
+
+function emptyAnalyticsMetrics() {
+  return {
+    activeSeconds: 0,
+    scans: 0,
+    llmCalls: 0,
+    jobsScanned: 0,
+    jobsSaved: 0,
+    emailsSent: 0,
+    emailJobsSent: 0
+  };
+}
+
+function addAnalyticsMetric(target, key, value) {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount) || !Object.prototype.hasOwnProperty.call(target, key)) return;
+  target[key] += amount;
+}
+
+function usageAnalyticsKey(type) {
+  if (type === "active_seconds") return "activeSeconds";
+  if (type === "scan") return "scans";
+  if (type === "llm") return "llmCalls";
+  if (type === "jobs_scanned" || type === "raw_jobs_found") return "jobsScanned";
+  if (type === "jobs_saved") return "jobsSaved";
+  return "";
+}
+
+function addScanRunJobsToAnalytics(scanRun, userMetrics, dailyMetrics) {
+  const totals = scanRun?.totals || {};
+  const jobsScanned = Number(totals.rawJobsFound || 0);
+  const jobsSaved = Number(totals.jobsFound || 0);
+  if (!jobsScanned && !jobsSaved) return;
+  addAnalyticsMetric(userMetrics, "jobsScanned", jobsScanned);
+  addAnalyticsMetric(userMetrics, "jobsSaved", jobsSaved);
+  const daily = dailyMetrics.get(dayKey(scanRun.finishedAt || scanRun.startedAt));
+  if (daily) {
+    addAnalyticsMetric(daily, "jobsScanned", jobsScanned);
+    addAnalyticsMetric(daily, "jobsSaved", jobsSaved);
+  }
+}
+
 function userStoreStats(userId) {
   const store = readStore(userId);
   return {
@@ -1037,6 +1109,125 @@ function recordUsage(userId, type, count = 1) {
   if (!count) return;
   db.prepare("INSERT INTO usage_events (id, user_id, type, count, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(`usage-${Date.now().toString(36)}-${randomBytes(5).toString("base64url")}`, userId, type, count, new Date().toISOString());
+}
+
+function recordScanUsage(userId, scanRun) {
+  const totals = scanRun?.totals || {};
+  recordUsage(userId, "scan", 1);
+  recordUsage(userId, "llm", totals.llmCalls || 0);
+  recordUsage(userId, "jobs_scanned", totals.rawJobsFound || 0);
+  recordUsage(userId, "jobs_saved", totals.jobsFound || 0);
+}
+
+function recordActiveUsage(userId, seconds) {
+  const activeSeconds = Math.round(Number(seconds || 0));
+  if (!Number.isFinite(activeSeconds) || activeSeconds <= 0) return 0;
+  const clamped = Math.max(1, Math.min(ACTIVITY_HEARTBEAT_MAX_SECONDS, activeSeconds));
+  recordUsage(userId, "active_seconds", clamped);
+  return clamped;
+}
+
+function buildAdminAnalytics(searchParams = new URLSearchParams()) {
+  const rangeDays = analyticsRangeDays(searchParams.get("range"));
+  const since = analyticsSinceIso(rangeDays);
+  const dayKeys = analyticsDayKeys(rangeDays);
+  const daily = new Map(dayKeys.map((date) => [date, { date, ...emptyAnalyticsMetrics() }]));
+  const users = db.prepare("SELECT id, email, is_admin, disabled, created_at FROM users ORDER BY created_at ASC").all();
+  const userMetrics = new Map(users.map((user) => [user.id, {
+    ...emptyAnalyticsMetrics(),
+    id: user.id,
+    email: user.email,
+    isAdmin: Boolean(user.is_admin),
+    disabled: Boolean(user.disabled),
+    createdAt: user.created_at,
+    currentCompanies: 0,
+    currentJobs: 0,
+    scanRuns: 0,
+    lastScanAt: null,
+    lastSeenAt: null,
+    lastEmailAt: null
+  }]));
+
+  const usageRows = db.prepare(`
+    SELECT user_id, type, substr(created_at, 1, 10) AS date, SUM(count) AS total, MAX(created_at) AS last_at
+    FROM usage_events
+    WHERE created_at >= ?
+    GROUP BY user_id, type, date
+  `).all(since);
+  const usersWithJobUsage = new Set();
+  for (const row of usageRows) {
+    const key = usageAnalyticsKey(row.type);
+    if (!key) continue;
+    const metrics = userMetrics.get(row.user_id);
+    if (!metrics) continue;
+    const amount = Number(row.total || 0);
+    addAnalyticsMetric(metrics, key, amount);
+    const dailyMetrics = daily.get(row.date);
+    if (dailyMetrics) addAnalyticsMetric(dailyMetrics, key, amount);
+    if (row.type === "active_seconds") metrics.lastSeenAt = row.last_at;
+    if (key === "jobsScanned" || key === "jobsSaved") usersWithJobUsage.add(row.user_id);
+  }
+
+  const emailRows = db.prepare(`
+    SELECT user_id, substr(sent_at, 1, 10) AS date, COUNT(*) AS job_count, COUNT(DISTINCT digest_id) AS email_count, MAX(sent_at) AS last_at
+    FROM email_digest_sends
+    WHERE sent_at >= ?
+    GROUP BY user_id, date
+  `).all(since);
+  for (const row of emailRows) {
+    const metrics = userMetrics.get(row.user_id);
+    if (!metrics) continue;
+    addAnalyticsMetric(metrics, "emailsSent", row.email_count);
+    addAnalyticsMetric(metrics, "emailJobsSent", row.job_count);
+    metrics.lastEmailAt = row.last_at;
+    const dailyMetrics = daily.get(row.date);
+    if (dailyMetrics) {
+      addAnalyticsMetric(dailyMetrics, "emailsSent", row.email_count);
+      addAnalyticsMetric(dailyMetrics, "emailJobsSent", row.job_count);
+    }
+  }
+
+  const storeRows = db.prepare("SELECT user_id, data FROM user_stores").all();
+  const sinceMs = safeDate(since);
+  for (const row of storeRows) {
+    const metrics = userMetrics.get(row.user_id);
+    if (!metrics) continue;
+    const store = parseStoreRow(row);
+    metrics.currentCompanies = store.targetCompanies?.length || 0;
+    metrics.currentJobs = store.companyScanJobs?.length || 0;
+    metrics.scanRuns = store.scanRuns?.length || 0;
+    metrics.lastScanAt = store.lastScrapeAt || store.scanRuns?.[0]?.finishedAt || store.scanRuns?.[0]?.startedAt || null;
+    if (!usersWithJobUsage.has(row.user_id)) {
+      for (const scanRun of store.scanRuns || []) {
+        const scanTime = safeDate(scanRun.finishedAt || scanRun.startedAt);
+        if (!scanTime || scanTime < sinceMs) continue;
+        addScanRunJobsToAnalytics(scanRun, metrics, daily);
+      }
+    }
+  }
+
+  const aggregateTotals = emptyAnalyticsMetrics();
+  let activeUserCount = 0;
+  const userRows = [...userMetrics.values()].map((metrics) => {
+    const hadActivity = metrics.activeSeconds || metrics.scans || metrics.llmCalls || metrics.jobsScanned || metrics.jobsSaved || metrics.emailsSent;
+    if (hadActivity) activeUserCount += 1;
+    for (const key of Object.keys(aggregateTotals)) {
+      addAnalyticsMetric(aggregateTotals, key, metrics[key]);
+    }
+    return metrics;
+  }).sort((a, b) => (b.activeSeconds - a.activeSeconds) || (b.scans - a.scans) || a.email.localeCompare(b.email));
+
+  return {
+    rangeDays,
+    since,
+    generatedAt: new Date().toISOString(),
+    totals: {
+      activeUsers: activeUserCount,
+      ...aggregateTotals
+    },
+    daily: [...daily.values()],
+    users: userRows
+  };
 }
 
 function normalizeList(value) {
@@ -4933,8 +5124,7 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
   }
 
   const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "email digest", store.resumeText || "", store.jobDetailCache || {}, user.id);
-  recordUsage(user.id, "scan", 1);
-  recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+  recordScanUsage(user.id, result.scanRun);
   const digestScanJobs = result.companyScanJobs || [];
   applyScanResultToStore(store, result);
   addScanRun(store, result.scanRun);
@@ -4994,8 +5184,7 @@ async function maybeDailyScrape() {
     if (store.lastScrapeAt && Date.now() - safeDate(store.lastScrapeAt) < ONE_DAY_MS) continue;
     if (!store.targetCompanies?.length) continue;
     const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "daily", store.resumeText || "", store.jobDetailCache || {}, user.id);
-    recordUsage(user.id, "scan", 1);
-    recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+    recordScanUsage(user.id, result.scanRun);
     applyScanResultToStore(store, result);
     addScanRun(store, result.scanRun);
     writeStore(user.id, store);
@@ -5067,6 +5256,22 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/state") {
       sendJson(res, 200, getState(user));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/analytics") {
+      if (!user.isAdmin) {
+        sendJson(res, 403, { error: "Only admins can view analytics." });
+        return;
+      }
+      sendJson(res, 200, buildAdminAnalytics(url.searchParams));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/activity") {
+      const body = await parseBody(req);
+      const recordedSeconds = recordActiveUsage(user.id, body.seconds);
+      sendJson(res, 200, { ok: true, recordedSeconds });
       return;
     }
 
@@ -5265,8 +5470,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const result = await scrapeJobs(store.profile, [company], store.jobFeedback || {}, store.companyScanJobs || [], "single company", store.resumeText || "", store.jobDetailCache || {}, user.id);
-      recordUsage(user.id, "scan", 1);
-      recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+      recordScanUsage(user.id, result.scanRun);
       applyScanResultToStore(store, result);
       addScanRun(store, result.scanRun);
       writeStore(user.id, store);
@@ -5291,8 +5495,7 @@ const server = http.createServer(async (req, res) => {
       assertCanScan(user.id);
       const store = readStore(user.id);
       const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "manual all", store.resumeText || "", store.jobDetailCache || {}, user.id);
-      recordUsage(user.id, "scan", 1);
-      recordUsage(user.id, "llm", result.scanRun?.totals?.llmCalls || 0);
+      recordScanUsage(user.id, result.scanRun);
       applyScanResultToStore(store, result);
       addScanRun(store, result.scanRun);
       writeStore(user.id, store);

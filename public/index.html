@@ -56,6 +56,10 @@
               <span class="nav-icon" aria-hidden="true">SC</span>
               <span class="nav-label">Scanner</span>
             </a>
+            <a class="nav-button" data-view="analytics" href="#analytics" aria-label="Analytics" data-admin-only="true" hidden>
+              <span class="nav-icon" aria-hidden="true">AN</span>
+              <span class="nav-label">Analytics</span>
+            </a>
             <a class="nav-button" data-view="feedback" href="#feedback" aria-label="Feedback">
               <span class="nav-icon" aria-hidden="true">FB</span>
               <span class="nav-label">Feedback</span>
@@ -439,6 +443,74 @@
             <div class="email-digest-status">
               <p id="emailDigestStatus">Not sent yet.</p>
               <p id="emailDigestMeta"></p>
+            </div>
+          </section>
+        </section>
+
+        <section id="analyticsView" class="view" data-admin-only="true" hidden>
+          <section class="analytics-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Admin visibility</p>
+                <h3>Analytics</h3>
+                <p class="scan-inline-note">Track activity, scans, matching usage, saved jobs, and email digest delivery.</p>
+              </div>
+              <div class="analytics-actions">
+                <div class="analytics-range" role="group" aria-label="Analytics range">
+                  <button type="button" data-analytics-range="7">7 days</button>
+                  <button type="button" data-analytics-range="30" class="active">30 days</button>
+                  <button type="button" data-analytics-range="90">90 days</button>
+                </div>
+                <button id="refreshAnalytics" type="button">Refresh</button>
+              </div>
+            </div>
+            <div class="metrics-grid analytics-metrics">
+              <article>
+                <span id="analyticsActiveUsers">0</span>
+                <p>active users</p>
+              </article>
+              <article>
+                <span id="analyticsActivityTime">0m</span>
+                <p>activity time</p>
+              </article>
+              <article>
+                <span id="analyticsScans">0</span>
+                <p>scans run</p>
+              </article>
+              <article>
+                <span id="analyticsJobs">0</span>
+                <p>jobs scanned</p>
+              </article>
+              <article>
+                <span id="analyticsLlmCalls">0</span>
+                <p>LLM calls</p>
+              </article>
+              <article>
+                <span id="analyticsEmails">0</span>
+                <p>emails sent</p>
+              </article>
+            </div>
+            <div id="analyticsStatus" class="scan-inline-note"></div>
+            <div class="analytics-grid">
+              <section class="analytics-subpanel">
+                <div class="section-heading compact">
+                  <div>
+                    <p class="eyebrow">Daily trend</p>
+                    <h3>Usage by day</h3>
+                  </div>
+                </div>
+                <div id="analyticsDailyChart" class="analytics-daily-chart"></div>
+              </section>
+              <section class="analytics-subpanel">
+                <div class="section-heading compact">
+                  <div>
+                    <p class="eyebrow">Per user</p>
+                    <h3>User activity</h3>
+                    <p id="analyticsGeneratedAt" class="scan-inline-note"></p>
+                  </div>
+                </div>
+                <div id="analyticsUserTable" class="analytics-user-table"></div>
+              </section>
             </div>
           </section>
         </section>
