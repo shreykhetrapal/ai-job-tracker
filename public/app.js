@@ -543,6 +543,25 @@ function scannerLogLine(call) {
   return `[${time}] ${status} ${call.type || "scan"}${count}${target}${message}`;
 }
 
+function scannerFailureDetailLines(company) {
+  const lines = [];
+  for (const error of company.errors || []) {
+    lines.push(`[company error] ${error}`);
+  }
+  const failedCalls = (company.calls || []).filter((call) => call.status === "error");
+  for (const call of failedCalls) {
+    lines.push(scannerLogLine(call));
+  }
+  const recentCalls = (company.calls || []).slice(-10);
+  if (recentCalls.length) {
+    lines.push("[recent calls]");
+    for (const call of recentCalls) {
+      lines.push(scannerLogLine(call));
+    }
+  }
+  return [...new Set(lines)];
+}
+
 function scrollScannerLogsToLatest() {
   const scroll = () => {
     for (const logView of document.querySelectorAll(".scanner-log-view")) {
@@ -1819,6 +1838,8 @@ function renderFailedScannerRunCard(run) {
   const totals = run.totals || {};
   const issueCount = userRunIssueCount(run);
   const failedCompanies = scannerFailureCompanies(run);
+  const emailDigest = run.emailDigest || null;
+  const canRerunEmailDigest = Boolean(emailDigest || run.scope === "email digest") && Boolean(run.userId);
   const summary = document.createElement("summary");
   summary.className = "scanner-run-summary";
   summary.innerHTML = `
@@ -1851,7 +1872,10 @@ function renderFailedScannerRunCard(run) {
         <h3></h3>
         <p></p>
       </div>
-      <span class="scanner-status"></span>
+      <div class="scanner-heading-actions">
+        <span class="scanner-status"></span>
+        <button type="button" class="scanner-rerun-email" hidden>Rerun email digest</button>
+      </div>
     </div>
     <div class="scanner-stat-strip">
       <span></span>
@@ -1869,6 +1893,11 @@ function renderFailedScannerRunCard(run) {
   body.querySelector("h3").textContent = `${statusText(run.scope)} scan`;
   body.querySelector(".scanner-run-heading p:last-child").textContent = `${dateTimeLabel(run.startedAt)} to ${dateTimeLabel(run.finishedAt)}`;
   body.querySelector(".scanner-status").textContent = statusText(run.status);
+  const rerunButton = body.querySelector(".scanner-rerun-email");
+  if (canRerunEmailDigest) {
+    rerunButton.hidden = false;
+    rerunButton.addEventListener("click", () => rerunEmailDigestForUser(run.userId, run.userEmail, rerunButton));
+  }
   const statSpans = body.querySelectorAll(".scanner-stat-strip span");
   statSpans[0].textContent = `${totals.companies || 0} companies`;
   statSpans[1].textContent = `${totals.rawJobsFound || 0} raw jobs`;
@@ -1907,10 +1936,10 @@ function renderFailedScannerRunCard(run) {
     stats[0].textContent = `${company.rawJobsFound || 0} raw`;
     stats[1].textContent = `${company.jobsFound || 0} saved`;
     stats[2].textContent = `${company.llmFailed || 0} LLM failed`;
-    const failedCalls = (company.calls || []).filter((call) => call.status === "error");
-    companyNode.querySelector(".scanner-log-view").textContent = failedCalls.length
-      ? failedCalls.map(scannerLogLine).join("\n")
-      : (company.errors || []).join("\n") || "No error log captured.";
+    const detailLines = scannerFailureDetailLines(company);
+    companyNode.querySelector(".scanner-log-view").textContent = detailLines.length
+      ? detailLines.join("\n")
+      : "No error log captured.";
     companyList.append(companyNode);
   }
   card.append(body);
@@ -2843,6 +2872,36 @@ async function refreshScannerState() {
     renderScanner();
   } catch {
     // Scanner polling is diagnostic only; the main dashboard can keep working.
+  }
+}
+
+async function rerunEmailDigestForUser(userId, userEmail, button) {
+  const label = userEmail || "this user";
+  const ok = window.confirm(`Rerun the email digest for ${label}? This may scan companies and send a new email if new relevant openings are found.`);
+  if (!ok) return;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Rerunning...";
+  try {
+    const nextState = await api(`/api/admin/users/${encodeURIComponent(userId)}/email-digest/rerun`, {
+      method: "POST",
+      body: "{}"
+    });
+    const rerun = nextState.adminEmailDigestRerun;
+    updateState(nextState);
+    await refreshScannerState();
+    if (rerun?.skipped) {
+      alert(`Email digest rerun skipped for ${label}: ${rerun.reason || "Not scheduled."}`);
+    } else if (rerun?.sent) {
+      alert(`Email digest rerun sent ${rerun.count || 0} job${rerun.count === 1 ? "" : "s"} for ${label}.`);
+    } else {
+      alert(`Email digest rerun completed for ${label}. No new jobs were sent.`);
+    }
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
   }
 }
 

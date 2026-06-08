@@ -752,6 +752,23 @@ details.scanner-run-card {
   content: "-";
 }
 
+.scanner-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.scanner-rerun-email {
+  min-height: 32px;
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: var(--accent-dark);
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .scanner-run-summary > div:first-child {
   grid-column: 1;
   display: grid;
@@ -2221,6 +2238,27 @@ label span {
   min-height: 20px;
   margin: 0;
   color: var(--rose);
+}
+
+.login-access-note {
+  margin: 18px 0 0;
+  border: 1px solid #cfe0f5;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #344054;
+  padding: 12px 14px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.login-access-note a {
+  color: var(--accent-dark);
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.login-access-note a:hover {
+  text-decoration: underline;
 }
 
 .pipeline {

@@ -411,6 +411,11 @@ function publicFeedback(row) {
   };
 }
 
+function getPublicUserById(userId) {
+  const row = db.prepare("SELECT id, email, is_admin, disabled, created_at FROM users WHERE id = ? AND disabled = 0").get(String(userId || ""));
+  return row ? publicUser(row) : null;
+}
+
 function listFeedback(user) {
   const sql = user.isAdmin
     ? `SELECT feedback_entries.*, users.email
@@ -5386,6 +5391,29 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/email-digest/test") {
       await runEmailDigestForUser(user, { test: true });
       sendJson(res, 200, getState(user));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname.startsWith("/api/admin/users/") && url.pathname.endsWith("/email-digest/rerun")) {
+      if (!user.isAdmin) {
+        sendJson(res, 403, { error: "Only admins can rerun email digests." });
+        return;
+      }
+      const targetUserId = decodeURIComponent(url.pathname.replace("/api/admin/users/", "").replace("/email-digest/rerun", ""));
+      const targetUser = getPublicUserById(targetUserId);
+      if (!targetUser) {
+        sendJson(res, 404, { error: "User not found." });
+        return;
+      }
+      const result = await runEmailDigestForUser(targetUser, { force: true });
+      sendJson(res, 200, {
+        ...getState(user),
+        adminEmailDigestRerun: {
+          userId: targetUser.id,
+          userEmail: targetUser.email,
+          ...result
+        }
+      });
       return;
     }
 
