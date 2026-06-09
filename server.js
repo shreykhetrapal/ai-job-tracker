@@ -25,6 +25,17 @@ const DAILY_SCAN_LIMIT = Number(process.env.DAILY_SCAN_LIMIT || 20);
 const DAILY_LLM_LIMIT = process.env.DAILY_LLM_LIMIT ? Number(process.env.DAILY_LLM_LIMIT) : null;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || "gpt-5-nano";
+const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:latest";
+const OLLAMA_TIMEOUT_MS = Math.max(Number(process.env.OLLAMA_TIMEOUT_MS || 300000), 300000);
+const parsedOllamaContextLength = Number(process.env.OLLAMA_CONTEXT_LENGTH || 4096);
+const OLLAMA_CONTEXT_LENGTH = Number.isFinite(parsedOllamaContextLength) && parsedOllamaContextLength > 0
+  ? Math.floor(parsedOllamaContextLength)
+  : 4096;
+const parsedOllamaConcurrency = Number(process.env.OLLAMA_APP_CONCURRENCY || process.env.OLLAMA_NUM_PARALLEL || 2);
+const OLLAMA_APP_CONCURRENCY = Number.isFinite(parsedOllamaConcurrency) && parsedOllamaConcurrency > 0
+  ? Math.floor(parsedOllamaConcurrency)
+  : 2;
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
@@ -128,9 +139,7 @@ async function loadLocalEnv(filePath) {
       value = value.slice(1, -1);
     }
 
-    if (process.env[key] === undefined) {
-      process.env[key] = value;
-    }
+    process.env[key] = value;
   }
 }
 
@@ -2796,48 +2805,8 @@ function summaryLooksLikeRawJson(summary) {
   return /^\{/.test(text) && /"summary"\s*:|"relevanceScore"\s*:/.test(text);
 }
 
-async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null) {
-  const detailLocation = detailLocationFromPostingContent(postingContent);
-  const location = resolveJobLocationStatus(job, profile, detailLocation);
-  if (!OPENAI_API_KEY || !postingContent) {
-    return {
-      ...extractedSummaryResult(job, postingContent, profile),
-      source: "extracted",
-      locationMatchesProfile: location.matchesProfile ? "Yes" : "No",
-      locationStatus: location.status,
-      listingLocation: location.listingLocation,
-      detailLocation
-    };
-  }
-
-  const memory = feedbackMemory(jobFeedback, historicalJobs);
-  incrementScanMetric(scanRun, companyLog, "llmCalls");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-  let response;
-  try {
-    response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: OPENAI_SUMMARY_MODEL,
-        reasoning: { effort: "low" },
-        text: {
-          verbosity: "low",
-          format: jobMatchResponseFormat
-        },
-        instructions: "You are a job-application matching assistant. Use only the supplied posting, candidate profile, resume text, and feedback examples. Return strict JSON only. Do not invent requirements or experience. The summary field must summarize only the job posting, not the candidate.",
-        input: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: `Company: ${job.company}
+function jobMatchPrompt(job, postingContent, profile, memory, resumeText, location) {
+  return `Company: ${job.company}
 Title: ${job.title}
 Listing location: ${location.listingLocation || job.location || "not listed"}
 Detail page location: ${location.detailLocation || "not found"}
@@ -2878,50 +2847,9 @@ Do not reduce relevanceScore because of location; location is evaluated separate
 Use scoreRange as a confidence interval around the score. Keep it narrow only when the posting text, resume, and profile provide clear matching evidence.
 Set locationMatchesProfile using the listing location above as the primary source. Treat the detail page location as secondary when it conflicts with the listing location. If the candidate profile has no locations, set locationMatchesProfile to Yes and ignore location as a filter.
 Use High only for scores 8-10, Medium for scores 5-7, and Low for scores 0-4. Use 8-10 only when the job title or core responsibilities closely match both the target role family and domain. Generic role words alone, such as Engineer, Analyst, Manager, or Specialist, are not enough. If the job is mainly a different function or domain, cap the score at 4 even when it mentions transferable skills like Python, SQL, analytics, statistics, Excel, or scripting. Use feedback examples to learn preferences.`
-              }
-            ]
-          }
-        ],
-        max_output_tokens: 1400
-      })
-    });
-  } catch (error) {
-    incrementScanMetric(scanRun, companyLog, "llmFailed");
-    recordScanCall(scanRun, companyLog, {
-      type: "OpenAI summary",
-      target: job.title,
-      status: "error",
-      message: error.message
-    });
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+}
 
-  if (!response.ok) {
-    incrementScanMetric(scanRun, companyLog, "llmFailed");
-    recordScanCall(scanRun, companyLog, {
-      type: "OpenAI summary",
-      target: job.title,
-      status: "error",
-      message: `${response.status} ${response.statusText}`
-    });
-    throw new Error(`LLM summary failed: ${response.status} ${response.statusText}`);
-  }
-  let data;
-  try {
-    data = await responseJsonOrThrow(response, "OpenAI");
-  } catch (error) {
-    incrementScanMetric(scanRun, companyLog, "llmFailed");
-    recordScanCall(scanRun, companyLog, {
-      type: "OpenAI summary",
-      target: job.title,
-      status: "error",
-      message: error.message
-    });
-    throw error;
-  }
-  const text = responseText(data);
+function llmMatchResultFromText(text, job, postingContent, profile, location, source) {
   const parsed = extractJsonObject(text) || partialJsonMatchResult(text);
   const parsedSummary = cleanText(parsed?.summary || text).slice(0, 900);
   const fallbackSummary = postingOnlySummaryFromContent(postingContent, job);
@@ -2943,16 +2871,9 @@ Use High only for scores 8-10, Medium for scores 5-7, and Low for scores 0-4. Us
   const fitReasons = Array.isArray(parsed?.fitReasons) ? parsed.fitReasons.map(cleanText).filter(Boolean).slice(0, 5) : [];
   const concerns = Array.isArray(parsed?.concerns) ? parsed.concerns.map(cleanText).filter(Boolean).slice(0, 5) : [];
   const matchedSignals = Array.isArray(parsed?.matchedSignals) ? parsed.matchedSignals.map(cleanText).filter(Boolean).slice(0, 8) : [];
-  incrementScanMetric(scanRun, companyLog, "llmSucceeded");
-  recordScanCall(scanRun, companyLog, {
-    type: "OpenAI summary",
-    target: job.title,
-    status: "ok",
-    message: OPENAI_SUMMARY_MODEL
-  });
   return {
     summary: summary || postingContent,
-    source: summary ? "llm" : "extracted",
+    source: summary ? source : "extracted",
     relevanceScore,
     roleRelevanceScore: relevanceScore,
     scoreRange,
@@ -2960,11 +2881,193 @@ Use High only for scores 8-10, Medium for scores 5-7, and Low for scores 0-4. Us
     locationMatchesProfile,
     locationStatus: location.status,
     listingLocation: location.listingLocation,
-    detailLocation,
+    detailLocation: location.detailLocation,
     relevanceBucket,
     fitReasons,
     concerns,
     matchedSignals
+  };
+}
+
+async function callOpenAIJobMatch(prompt, signal) {
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    signal,
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: OPENAI_SUMMARY_MODEL,
+      reasoning: { effort: "low" },
+      text: {
+        verbosity: "low",
+        format: jobMatchResponseFormat
+      },
+      instructions: "You are a job-application matching assistant. Use only the supplied posting, candidate profile, resume text, and feedback examples. Return strict JSON only. Do not invent requirements or experience. The summary field must summarize only the job posting, not the candidate.",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: prompt
+            }
+          ]
+        }
+      ],
+      max_output_tokens: 1400
+    })
+  });
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const data = await responseJsonOrThrow(response, "OpenAI");
+      detail = data.error?.message || detail;
+    } catch (error) {
+      detail = error.message;
+    }
+    throw new Error(`OpenAI summary failed: ${detail}`);
+  }
+  const data = await responseJsonOrThrow(response, "OpenAI");
+  return responseText(data);
+}
+
+let activeOllamaCalls = 0;
+const pendingOllamaCalls = [];
+
+async function withOllamaSlot(task) {
+  if (activeOllamaCalls >= OLLAMA_APP_CONCURRENCY) {
+    await new Promise((resolve) => pendingOllamaCalls.push(resolve));
+  }
+  activeOllamaCalls += 1;
+  try {
+    return await task();
+  } finally {
+    activeOllamaCalls = Math.max(0, activeOllamaCalls - 1);
+    const next = pendingOllamaCalls.shift();
+    if (next) next();
+  }
+}
+
+async function callOllamaJobMatch(prompt, signal) {
+  return withOllamaSlot(async () => {
+    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        prompt,
+        stream: false,
+        format: "json",
+        options: {
+          temperature: 0,
+          num_ctx: OLLAMA_CONTEXT_LENGTH,
+          num_predict: 1400
+        }
+      })
+    });
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const data = await responseJsonOrThrow(response, "Ollama");
+        detail = data.error || data.message || detail;
+      } catch (error) {
+        detail = error.message;
+      }
+      throw new Error(`Ollama summary failed: ${detail}`);
+    }
+    const data = await responseJsonOrThrow(response, "Ollama");
+    return cleanText(data.response || "");
+  });
+}
+
+async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null) {
+  const detailLocation = detailLocationFromPostingContent(postingContent);
+  const location = resolveJobLocationStatus(job, profile, detailLocation);
+  if (!postingContent) {
+    return {
+      ...extractedSummaryResult(job, postingContent, profile),
+      source: "extracted",
+      locationMatchesProfile: location.matchesProfile ? "Yes" : "No",
+      locationStatus: location.status,
+      listingLocation: location.listingLocation,
+      detailLocation
+    };
+  }
+
+  const memory = feedbackMemory(jobFeedback, historicalJobs);
+  const prompt = jobMatchPrompt(job, postingContent, profile, memory, resumeText, location);
+
+  if (OPENAI_API_KEY) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    incrementScanMetric(scanRun, companyLog, "llmCalls");
+    try {
+      const text = await callOpenAIJobMatch(prompt, controller.signal);
+      const result = llmMatchResultFromText(text, job, postingContent, profile, location, "llm");
+      incrementScanMetric(scanRun, companyLog, "llmSucceeded");
+      recordScanCall(scanRun, companyLog, {
+        type: "OpenAI summary",
+        target: job.title,
+        status: "ok",
+        message: OPENAI_SUMMARY_MODEL
+      });
+      return result;
+    } catch (error) {
+      recordScanCall(scanRun, companyLog, {
+        type: "OpenAI summary",
+        target: job.title,
+        status: "warning",
+        message: error.message
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  if (OLLAMA_BASE_URL && OLLAMA_MODEL) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+    incrementScanMetric(scanRun, companyLog, "llmCalls");
+    try {
+      const text = await callOllamaJobMatch(prompt, controller.signal);
+      const result = llmMatchResultFromText(text, job, postingContent, profile, location, "ollama");
+      incrementScanMetric(scanRun, companyLog, "llmSucceeded");
+      recordScanCall(scanRun, companyLog, {
+        type: "Ollama fallback",
+        target: job.title,
+        status: "ok",
+        message: OLLAMA_MODEL
+      });
+      return result;
+    } catch (error) {
+      recordScanCall(scanRun, companyLog, {
+        type: "Ollama fallback",
+        target: job.title,
+        status: "warning",
+        message: error.message
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  incrementScanMetric(scanRun, companyLog, "llmFailed");
+  recordScanCall(scanRun, companyLog, {
+    type: "LLM providers",
+    target: job.title,
+    status: "error",
+    message: "Used posting text after all LLM providers failed"
+  });
+  return {
+    ...extractedSummaryResult(job, postingContent, profile),
+    source: "extracted",
+    locationMatchesProfile: location.matchesProfile ? "Yes" : "No",
+    locationStatus: location.status,
+    listingLocation: location.listingLocation,
+    detailLocation
   };
 }
 
@@ -3022,6 +3125,90 @@ async function checkOpenAIStatus() {
       message: error.message
     };
   }
+}
+
+async function checkOllamaStatus() {
+  if (!OLLAMA_BASE_URL || !OLLAMA_MODEL) {
+    return {
+      configured: false,
+      ok: false,
+      model: OLLAMA_MODEL,
+      baseUrl: OLLAMA_BASE_URL,
+      contextLength: OLLAMA_CONTEXT_LENGTH,
+      appConcurrency: OLLAMA_APP_CONCURRENCY,
+      message: "OLLAMA_BASE_URL or OLLAMA_MODEL is not set."
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    let response;
+    try {
+      response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
+        method: "GET",
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) {
+      return {
+        configured: true,
+        ok: false,
+        model: OLLAMA_MODEL,
+        baseUrl: OLLAMA_BASE_URL,
+        contextLength: OLLAMA_CONTEXT_LENGTH,
+        appConcurrency: OLLAMA_APP_CONCURRENCY,
+        message: `${response.status} ${response.statusText}`
+      };
+    }
+    const data = await responseJsonOrThrow(response, "Ollama");
+    const models = Array.isArray(data.models) ? data.models : [];
+    const modelNames = models.map((model) => model.name).filter(Boolean);
+    const hasModel = modelNames.includes(OLLAMA_MODEL);
+    return {
+      configured: true,
+      ok: hasModel,
+      model: OLLAMA_MODEL,
+      baseUrl: OLLAMA_BASE_URL,
+      contextLength: OLLAMA_CONTEXT_LENGTH,
+      appConcurrency: OLLAMA_APP_CONCURRENCY,
+      message: hasModel ? "OK" : `${OLLAMA_MODEL} is not installed. Available: ${modelNames.join(", ") || "none"}`
+    };
+  } catch (error) {
+    return {
+      configured: true,
+      ok: false,
+      model: OLLAMA_MODEL,
+      baseUrl: OLLAMA_BASE_URL,
+      contextLength: OLLAMA_CONTEXT_LENGTH,
+      appConcurrency: OLLAMA_APP_CONCURRENCY,
+      message: error.message
+    };
+  }
+}
+
+async function checkLlmStatus() {
+  const [primary, fallback] = await Promise.all([
+    checkOpenAIStatus(),
+    checkOllamaStatus()
+  ]);
+  const ok = primary.ok || fallback.ok;
+  return {
+    configured: primary.configured || fallback.configured,
+    ok,
+    model: primary.ok ? primary.model : fallback.model,
+    message: ok ? "At least one LLM provider is ready." : [primary.message, fallback.message].filter(Boolean).join(" · "),
+    primary: {
+      provider: "OpenAI",
+      ...primary
+    },
+    fallback: {
+      provider: "Ollama",
+      ...fallback
+    }
+  };
 }
 
 async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null, jobDetailCache = {}) {
@@ -5281,7 +5468,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/llm-status") {
-      sendJson(res, 200, await checkOpenAIStatus());
+      sendJson(res, 200, await checkLlmStatus());
       return;
     }
 
@@ -5634,8 +5821,16 @@ server.on("error", (error) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`Job dashboard running at http://${HOST}:${PORT}`);
-  maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message));
-  maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message));
-  setInterval(() => maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message)), 60 * 60 * 1000);
-  setInterval(() => maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message)), 60 * 60 * 1000);
+  if (process.env.DISABLE_BACKGROUND_JOBS === "1") {
+    console.log("Background jobs disabled for this process.");
+    return;
+  }
+  const firstRunDelayMs = Math.max(0, Number(process.env.BACKGROUND_JOBS_FIRST_RUN_DELAY_MS || 180000));
+  const intervalMs = Math.max(60000, Number(process.env.BACKGROUND_JOBS_INTERVAL_MS || 60 * 60 * 1000));
+  setTimeout(() => {
+    maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message));
+    maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message));
+  }, firstRunDelayMs);
+  setInterval(() => maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message)), intervalMs);
+  setInterval(() => maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message)), intervalMs);
 });

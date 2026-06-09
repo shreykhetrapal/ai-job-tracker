@@ -1594,7 +1594,13 @@ function renderSelectedJobDetail(job) {
     markJobViewedLocally(job.id);
     markJobViewed(job.id);
   });
-  const summaryLabel = job.summarySource === "llm" ? "LLM summary" : job.summarySource === "extracted" ? "Extracted summary" : "Summary";
+  const summaryLabel = job.summarySource === "llm"
+    ? "OpenAI summary"
+    : job.summarySource === "ollama"
+      ? "Ollama summary"
+      : job.summarySource === "extracted"
+        ? "Extracted summary"
+        : "Summary";
   wrapper.querySelector(".job-score-line").textContent = `${relevanceScoreLabel(job)} relevance · ${job.detailFetchedAt ? `${summaryLabel} fetched ${dateTimeLabel(job.detailFetchedAt)}` : "Summary fallback"}`;
   wrapper.querySelector(".job-detail-summary").textContent = job.description || "No summary available from this posting.";
 
@@ -3138,11 +3144,21 @@ els.scannerScanNow.addEventListener("click", async () => {
 els.checkLlm.addEventListener("click", async () => {
   els.checkLlm.disabled = true;
   els.checkLlm.textContent = "Checking...";
-  els.llmStatus.textContent = "Checking OpenAI connection...";
+  els.llmStatus.textContent = "Checking LLM providers...";
   try {
     const status = await api("/api/llm-status");
-    if (!status.configured) {
-      els.llmStatus.textContent = "No API key set for this server.";
+    const openai = status.primary;
+    const ollama = status.fallback;
+    const openaiText = openai?.ok
+      ? `OpenAI connected · ${openai.model}`
+      : `OpenAI unavailable · ${openai?.message || "not configured"}`;
+    const ollamaText = ollama?.ok
+      ? `Ollama fallback ready · ${ollama.model}`
+      : `Ollama fallback unavailable · ${ollama?.message || "not configured"}`;
+    if (openai || ollama) {
+      els.llmStatus.textContent = `${openaiText} · ${ollamaText}`;
+    } else if (!status.configured) {
+      els.llmStatus.textContent = "No LLM provider is set for this server.";
     } else if (status.ok) {
       els.llmStatus.textContent = `LLM connected · ${status.model}`;
     } else {
