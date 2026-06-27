@@ -3147,16 +3147,18 @@ els.checkLlm.addEventListener("click", async () => {
   els.llmStatus.textContent = "Checking LLM providers...";
   try {
     const status = await api("/api/llm-status");
-    const openai = status.primary;
-    const ollama = status.fallback;
+    const ollama = status.primary;
+    const openai = status.fallback;
+    const providerLabel = (provider) => provider?.provider || "Provider";
+    const providerModel = (provider) => provider?.model || "unknown model";
     const openaiText = openai?.ok
-      ? `OpenAI connected · ${openai.model}`
-      : `OpenAI unavailable · ${openai?.message || "not configured"}`;
+      ? `${providerLabel(openai)} fallback ready · ${providerModel(openai)}`
+      : `${providerLabel(openai)} fallback unavailable · ${openai?.message || "not configured"}`;
     const ollamaText = ollama?.ok
-      ? `Ollama fallback ready · ${ollama.model}`
-      : `Ollama fallback unavailable · ${ollama?.message || "not configured"}`;
+      ? `${providerLabel(ollama)} primary ready · ${providerModel(ollama)}`
+      : `${providerLabel(ollama)} primary unavailable · ${ollama?.message || "not configured"}`;
     if (openai || ollama) {
-      els.llmStatus.textContent = `${openaiText} · ${ollamaText}`;
+      els.llmStatus.textContent = `${ollamaText} · ${openaiText}`;
     } else if (!status.configured) {
       els.llmStatus.textContent = "No LLM provider is set for this server.";
     } else if (status.ok) {

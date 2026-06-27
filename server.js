@@ -1730,12 +1730,23 @@ function jobDetailCacheKey(job) {
     .join("|");
 }
 
-function jobScoringInputHash(profile, jobFeedback, resumeText) {
+function stableJobPostedAt(value) {
+  return parseJobDate(value) || "";
+}
+
+function jobFirstSeenAt(job, existing = {}) {
+  return existing.firstSeenAt || job.firstSeenAt || new Date().toISOString();
+}
+
+function jobScoringInputHash(profile, resumeText, memory = { relevant: [], notRelevant: [] }) {
   return stableHash(JSON.stringify({
-    scoringSchemaVersion: 5,
+    scoringSchemaVersion: 6,
     profile,
     resumeText,
-    jobFeedback
+    feedbackMemory: {
+      relevant: memory.relevant || [],
+      notRelevant: memory.notRelevant || []
+    }
   }));
 }
 
@@ -1745,7 +1756,10 @@ function cachedSummaryResult(entry) {
     ? extractJsonObject(entry.summary) || partialJsonMatchResult(entry.summary)
     : null;
   const parsedSummary = cleanText(parsed?.summary || "");
-  const summary = parsedSummary && !summaryMentionsCandidate(parsedSummary)
+  const postingSummary = cleanText(entry.postingSummary || "");
+  const summary = postingSummary
+    ? postingSummary
+    : parsedSummary && !summaryMentionsCandidate(parsedSummary)
     ? parsedSummary
     : summaryLooksLikeRawJson(entry.summary) && entry.postingContent
       ? postingOnlySummaryFromContent(entry.postingContent, entry)
@@ -1818,7 +1832,11 @@ function repairCandidateCentricSummaries(jobs = [], jobDetailCache = {}) {
 
 function writeJobDetailCacheEntry(cache, key, job, postingContent, result, scoringInputHash) {
   if (!cache || !key) return;
+  const existing = cache[key] || {};
+  const now = new Date().toISOString();
+  const postingSummary = result.postingSummary || existing.postingSummary || result.summary || postingOnlySummaryFromContent(postingContent, job);
   cache[key] = {
+    ...existing,
     key,
     companyId: job.companyId,
     company: job.company,
@@ -1826,10 +1844,14 @@ function writeJobDetailCacheEntry(cache, key, job, postingContent, result, scori
     title: job.title,
     location: job.location || "",
     url: job.url,
-    postedAt: parseJobDate(job.postedAt) || job.postedAt || null,
+    postedAt: stableJobPostedAt(job.postedAt),
+    firstSeenAt: jobFirstSeenAt(job, existing),
+    lastSeenAt: now,
     tags: Array.isArray(job.tags) ? job.tags : [],
     postingContent,
-    summary: result.summary,
+    postingSummary,
+    postingSummarySource: result.source || existing.postingSummarySource || "",
+    summary: result.summary || postingSummary,
     summarySource: result.source,
     relevanceScore: result.relevanceScore,
     roleRelevanceScore: result.roleRelevanceScore ?? result.relevanceScore,
@@ -1844,14 +1866,16 @@ function writeJobDetailCacheEntry(cache, key, job, postingContent, result, scori
     concerns: result.concerns || [],
     matchedSignals: result.matchedSignals || [],
     scoringInputHash,
-    fetchedAt: new Date().toISOString(),
-    usedAt: new Date().toISOString()
+    fetchedAt: existing.fetchedAt || now,
+    usedAt: now
   };
 }
 
 function writeExtractedJobDetailCacheEntry(cache, key, job, postingContent, result, error = null) {
   if (!cache || !key || !postingContent) return;
   const existing = cache[key] || {};
+  const now = new Date().toISOString();
+  const postingSummary = existing.postingSummary || result.postingSummary || result.summary || postingOnlySummaryFromContent(postingContent, job);
   cache[key] = {
     ...existing,
     key,
@@ -1861,10 +1885,14 @@ function writeExtractedJobDetailCacheEntry(cache, key, job, postingContent, resu
     title: job.title,
     location: job.location || "",
     url: job.url,
-    postedAt: parseJobDate(job.postedAt) || job.postedAt || null,
+    postedAt: stableJobPostedAt(job.postedAt),
+    firstSeenAt: jobFirstSeenAt(job, existing),
+    lastSeenAt: now,
     tags: Array.isArray(job.tags) ? job.tags : [],
     postingContent,
-    summary: result.summary,
+    postingSummary,
+    postingSummarySource: existing.postingSummarySource || result.source || "",
+    summary: result.summary || postingSummary,
     summarySource: result.source,
     relevanceScore: existing.relevanceScore ?? result.relevanceScore,
     roleRelevanceScore: existing.roleRelevanceScore ?? result.roleRelevanceScore ?? result.relevanceScore,
@@ -1880,13 +1908,40 @@ function writeExtractedJobDetailCacheEntry(cache, key, job, postingContent, resu
     matchedSignals: existing.matchedSignals || result.matchedSignals || [],
     scoringInputHash: existing.scoringInputHash || "",
     lastLlmError: error ? cleanText(error.message || error).slice(0, 240) : existing.lastLlmError || "",
-    fetchedAt: existing.fetchedAt || new Date().toISOString(),
-    usedAt: new Date().toISOString()
+    fetchedAt: existing.fetchedAt || now,
+    usedAt: now
   };
 }
 
 function markJobDetailCacheUsed(cache, key) {
   if (cache?.[key]) cache[key].usedAt = new Date().toISOString();
+}
+
+function findJobDetailCacheEntry(cache = {}, key, job) {
+  if (cache?.[key]) return { key, entry: cache[key] };
+  const identity = externalJobIdentity(job);
+  const company = String(job.companyId || job.company || "").toLowerCase();
+  const url = normalizeJobOpenUrl(job);
+  const match = Object.entries(cache || {}).find(([, entry]) => {
+    if (!entry) return false;
+    const sameUrl = url && normalizeJobOpenUrl(entry) === url;
+    const sameIdentity = String(entry.companyId || entry.company || "").toLowerCase() === company &&
+      String(entry.jobIdentity || "").toLowerCase() === String(identity || "").toLowerCase();
+    return sameUrl || sameIdentity;
+  });
+  return match ? { key: match[0], entry: match[1] } : { key, entry: null };
+}
+
+function hasDirectJobFeedback(job, jobFeedback = {}) {
+  const feedback = jobFeedback?.[job.id];
+  return Boolean(feedback?.relevance || feedback?.manualRelevanceScore !== undefined);
+}
+
+function canReusePersonalizedCache(cached, scoringInputHash, job, jobFeedback = {}) {
+  if (!cached?.summary) return false;
+  if (cached.scoringInputHash === scoringInputHash) return true;
+  if (hasDirectJobFeedback(job, jobFeedback)) return false;
+  return clampRelevanceScore(cached.relevanceScore) !== null;
 }
 
 function pruneJobDetailCache(cache, activeJobs = []) {
@@ -2873,6 +2928,7 @@ function llmMatchResultFromText(text, job, postingContent, profile, location, so
   const matchedSignals = Array.isArray(parsed?.matchedSignals) ? parsed.matchedSignals.map(cleanText).filter(Boolean).slice(0, 8) : [];
   return {
     summary: summary || postingContent,
+    postingSummary: summary || fallbackSummary,
     source: summary ? source : "extracted",
     relevanceScore,
     roleRelevanceScore: relevanceScore,
@@ -2983,7 +3039,7 @@ async function callOllamaJobMatch(prompt, signal) {
   });
 }
 
-async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null) {
+async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null, providedMemory = null) {
   const detailLocation = detailLocationFromPostingContent(postingContent);
   const location = resolveJobLocationStatus(job, profile, detailLocation);
   if (!postingContent) {
@@ -2997,35 +3053,8 @@ async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, 
     };
   }
 
-  const memory = feedbackMemory(jobFeedback, historicalJobs);
+  const memory = providedMemory || feedbackMemory(jobFeedback, historicalJobs);
   const prompt = jobMatchPrompt(job, postingContent, profile, memory, resumeText, location);
-
-  if (OPENAI_API_KEY) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-    incrementScanMetric(scanRun, companyLog, "llmCalls");
-    try {
-      const text = await callOpenAIJobMatch(prompt, controller.signal);
-      const result = llmMatchResultFromText(text, job, postingContent, profile, location, "llm");
-      incrementScanMetric(scanRun, companyLog, "llmSucceeded");
-      recordScanCall(scanRun, companyLog, {
-        type: "OpenAI summary",
-        target: job.title,
-        status: "ok",
-        message: OPENAI_SUMMARY_MODEL
-      });
-      return result;
-    } catch (error) {
-      recordScanCall(scanRun, companyLog, {
-        type: "OpenAI summary",
-        target: job.title,
-        status: "warning",
-        message: error.message
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
 
   if (OLLAMA_BASE_URL && OLLAMA_MODEL) {
     const controller = new AbortController();
@@ -3036,7 +3065,7 @@ async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, 
       const result = llmMatchResultFromText(text, job, postingContent, profile, location, "ollama");
       incrementScanMetric(scanRun, companyLog, "llmSucceeded");
       recordScanCall(scanRun, companyLog, {
-        type: "Ollama fallback",
+        type: "Ollama summary",
         target: job.title,
         status: "ok",
         message: OLLAMA_MODEL
@@ -3044,7 +3073,34 @@ async function summarizeWithLLM(job, postingContent, profile, jobFeedback = {}, 
       return result;
     } catch (error) {
       recordScanCall(scanRun, companyLog, {
-        type: "Ollama fallback",
+        type: "Ollama summary",
+        target: job.title,
+        status: "warning",
+        message: error.message
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  if (OPENAI_API_KEY) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    incrementScanMetric(scanRun, companyLog, "llmCalls");
+    try {
+      const text = await callOpenAIJobMatch(prompt, controller.signal);
+      const result = llmMatchResultFromText(text, job, postingContent, profile, location, "llm");
+      incrementScanMetric(scanRun, companyLog, "llmSucceeded");
+      recordScanCall(scanRun, companyLog, {
+        type: "OpenAI fallback",
+        target: job.title,
+        status: "ok",
+        message: OPENAI_SUMMARY_MODEL
+      });
+      return result;
+    } catch (error) {
+      recordScanCall(scanRun, companyLog, {
+        type: "OpenAI fallback",
         target: job.title,
         status: "warning",
         message: error.message
@@ -3191,8 +3247,8 @@ async function checkOllamaStatus() {
 
 async function checkLlmStatus() {
   const [primary, fallback] = await Promise.all([
-    checkOpenAIStatus(),
-    checkOllamaStatus()
+    checkOllamaStatus(),
+    checkOpenAIStatus()
   ]);
   const ok = primary.ok || fallback.ok;
   return {
@@ -3201,11 +3257,11 @@ async function checkLlmStatus() {
     model: primary.ok ? primary.model : fallback.model,
     message: ok ? "At least one LLM provider is ready." : [primary.message, fallback.message].filter(Boolean).join(" · "),
     primary: {
-      provider: "OpenAI",
+      provider: "Ollama",
       ...primary
     },
     fallback: {
-      provider: "Ollama",
+      provider: "OpenAI",
       ...fallback
     }
   };
@@ -3213,11 +3269,13 @@ async function checkLlmStatus() {
 
 async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJobs = [], resumeText = "", scanRun = null, companyLog = null, jobDetailCache = {}) {
   const cacheKey = jobDetailCacheKey(job);
-  const scoringInputHash = jobScoringInputHash(profile, jobFeedback, resumeText);
-  const cached = jobDetailCache?.[cacheKey];
+  const memory = feedbackMemory(jobFeedback, historicalJobs);
+  const scoringInputHash = jobScoringInputHash(profile, resumeText, memory);
+  const cachedLookup = findJobDetailCacheEntry(jobDetailCache, cacheKey, job);
+  const cached = cachedLookup.entry;
   if (cached?.postingContent) {
-    markJobDetailCacheUsed(jobDetailCache, cacheKey);
-    if (cached.scoringInputHash === scoringInputHash && cached.summary) {
+    markJobDetailCacheUsed(jobDetailCache, cachedLookup.key);
+    if (canReusePersonalizedCache(cached, scoringInputHash, job, jobFeedback)) {
       incrementScanMetric(scanRun, companyLog, "detailCacheHits");
       incrementScanMetric(scanRun, companyLog, "llmCacheHits");
       recordScanCall(scanRun, companyLog, {
@@ -3226,7 +3284,9 @@ async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJob
         status: "ok",
         message: "Reused posting detail and LLM score"
       });
-      return cachedSummaryResult(cached);
+      const cachedResult = cachedSummaryResult(cached);
+      if (cachedLookup.key !== cacheKey) writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, cached.postingContent, cachedResult, scoringInputHash);
+      return cachedResult;
     }
 
     incrementScanMetric(scanRun, companyLog, "detailCacheHits");
@@ -3237,7 +3297,7 @@ async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJob
       message: "Reused posting detail; refreshed personalized score"
     });
     try {
-      const refreshed = await summarizeWithLLM(job, cached.postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog);
+      const refreshed = await summarizeWithLLM(job, cached.postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog, memory);
       writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, cached.postingContent, refreshed, scoringInputHash);
       return refreshed;
     } catch (error) {
@@ -3248,6 +3308,7 @@ async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJob
           status: "ok",
           message: "Used cached summary after LLM refresh failed"
         });
+        if (cachedLookup.key !== cacheKey) writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, cached.postingContent, cachedSummaryResult(cached), scoringInputHash);
         return cachedSummaryResult(cached);
       }
       const fallback = extractedSummaryResult(job, cached.postingContent, profile);
@@ -3337,7 +3398,7 @@ async function fetchPostingSummary(job, profile, jobFeedback = {}, historicalJob
   }
 
   try {
-    const result = await summarizeWithLLM(job, postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog);
+    const result = await summarizeWithLLM(job, postingContent, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog, memory);
     writeJobDetailCacheEntry(jobDetailCache, cacheKey, job, postingContent, result, scoringInputHash);
     return result;
   } catch (error) {
@@ -3432,7 +3493,7 @@ function extractCompanyJobs(html, company, profile) {
       company: company.name,
       location,
       url,
-      postedAt: listedAt || new Date().toISOString(),
+      postedAt: listedAt || "",
       tags: ["Company watchlist"],
       description: `Found on ${company.name}'s careers page. ${company.notes || ""}`.trim()
     });
@@ -3518,7 +3579,7 @@ async function fetchGreenhouseJobs(company, profile, scanRun = null, companyLog 
       company: company.name,
       location: greenhouseJobLocation(item),
       url,
-      postedAt: postedAt || new Date().toISOString(),
+      postedAt: postedAt || "",
       tags: ["Company watchlist", "Greenhouse", ...departments.slice(0, 3)],
       description: content || `Found on ${company.name}'s Greenhouse board. ${company.notes || ""}`.trim(),
       postingContentFetched: Boolean(content)
@@ -3706,7 +3767,7 @@ function ashbyPostingToJob(posting, company, boardName, source = "Ashby") {
     company: company.name,
     location: cleanText(location),
     url,
-    postedAt: parseJobDate(posting.updatedAt || posting.publishedDate) || new Date().toISOString(),
+    postedAt: parseJobDate(posting.updatedAt || posting.publishedDate) || "",
     tags: ["Company watchlist", "Ashby", cleanText(team)].filter(Boolean),
     description: content || `Found on ${company.name}'s Ashby careers board. ${team ? `Team: ${cleanText(team)}.` : ""} ${company.notes || ""}`.trim(),
     postingContentFetched: Boolean(content)
@@ -3851,7 +3912,7 @@ function microsoftPositionToJob(position, company) {
     company: company.name,
     location: cleanText(locations.join(", ") || "Microsoft careers"),
     url,
-    postedAt: microsoftPositionDate(position) || new Date().toISOString(),
+    postedAt: microsoftPositionDate(position) || "",
     tags: ["Company watchlist", position.department, position.displayJobId].filter(Boolean).map(cleanText),
     description: `Microsoft Careers listing. ${[position.department, position.displayJobId].filter(Boolean).join(" · ")}`.trim()
   };
@@ -4085,7 +4146,7 @@ function walmartDetailsToJob(details, company, fallbackUrl = "") {
     company: company.name,
     location: walmartDetailsLocation(details),
     url,
-    postedAt: parseJobDate(details.jobPostingStartDate || details.recruitingStartDate || details.createdAt) || new Date().toISOString(),
+    postedAt: parseJobDate(details.jobPostingStartDate || details.recruitingStartDate || details.createdAt) || "",
     tags: ["Company watchlist", details.brand, details.businessSegment?.value, ...employmentTypes].filter(Boolean).map(cleanText),
     description: content || `Walmart Careers listing. ${company.notes || ""}`.trim(),
     postingContentFetched: Boolean(content)
@@ -4158,7 +4219,7 @@ function walmartSearchResultToJob(result, company) {
     company: company.name,
     location: walmartMetadataLocation(metadata),
     url,
-    postedAt: walmartResultDate(result) || new Date().toISOString(),
+    postedAt: walmartResultDate(result) || "",
     tags: ["Company watchlist", metadata.brand, ...areas, ...categories, ...employmentTypes].filter(Boolean).map(cleanText).slice(0, 8),
     description: summary || `Walmart Careers listing. ${company.notes || ""}`.trim(),
     matchedSignals: skills.slice(0, 6).map(cleanText),
@@ -4397,7 +4458,7 @@ function extractEightfoldPositions(html) {
 }
 
 function dateFromUnixSeconds(value) {
-  return parseJobDate(value) || new Date().toISOString();
+  return parseJobDate(value) || "";
 }
 
 function eightfoldPositionDate(position) {
@@ -4644,7 +4705,7 @@ async function fetchMetaCareersJobs(company, profile, landingHtml, scanRun = nul
         company: company.name,
         location: locations.join(", ") || "Meta Careers",
         url,
-        postedAt: postedAt || new Date().toISOString(),
+        postedAt: postedAt || "",
         tags: ["Company watchlist", ...teams.slice(0, 3), ...subTeams.slice(0, 3)],
         description: `Meta Careers listing. Teams: ${[...teams, ...subTeams].slice(0, 6).join(", ") || "not listed"}. Locations: ${locations.slice(0, 6).join(", ") || "not listed"}.`
       });
@@ -4864,8 +4925,22 @@ function rememberLastGoodJobBoard(store) {
 function mergeScannedJobs(existingJobs = [], resultJobs = [], scanResults = [], profile, jobFeedback = {}) {
   const { ids, names } = successfulScanKeys(scanResults);
   if (!ids.size && !names.size) return annotateJobs(uniqJobs(existingJobs), profile, jobFeedback);
-  const keptJobs = existingJobs.filter((job) => !ids.has(job.companyId) && !names.has(job.company));
-  return annotateJobs(uniqJobs([...keptJobs, ...resultJobs]), profile, jobFeedback);
+  const now = new Date().toISOString();
+  const existingByIdentity = new Map(existingJobs.map((job) => [`${job.companyId || job.company}|${externalJobIdentity(job)}`.toLowerCase(), job]));
+  const keptJobs = existingJobs.filter((job) => !ids.has(job.companyId) && !names.has(job.company)).map((job) => ({
+    ...job,
+    firstSeenAt: job.firstSeenAt || job.detailFetchedAt || job.postedAt || now,
+    lastSeenAt: job.lastSeenAt || now
+  }));
+  const seenResultJobs = resultJobs.map((job) => {
+    const existing = existingByIdentity.get(`${job.companyId || job.company}|${externalJobIdentity(job)}`.toLowerCase()) || {};
+    return {
+      ...job,
+      firstSeenAt: existing.firstSeenAt || job.firstSeenAt || now,
+      lastSeenAt: now
+    };
+  });
+  return annotateJobs(uniqJobs([...keptJobs, ...seenResultJobs]), profile, jobFeedback);
 }
 
 function applyScanResultToStore(store, result) {
@@ -4988,6 +5063,75 @@ function digestEligibleJobs(jobs, store, sentKeys) {
 
 function digestCandidateJobs(jobs, store, sentKeys) {
   return digestEligibleJobs(jobs, store, sentKeys).slice(0, emailDigestMaxJobs(store.emailDigest || {}));
+}
+
+const EMAIL_DIGEST_CACHE_SCAN_SCOPES = new Set(["daily", "manual all", "email digest"]);
+
+function isFullScanScope(scope = "") {
+  return EMAIL_DIGEST_CACHE_SCAN_SCOPES.has(String(scope || "").toLowerCase());
+}
+
+function freshEmailDigestScanRun(store, settings) {
+  const timeZone = normalizeTimeZone(settings?.timeZone || defaultTimeZone());
+  const todayKey = localDateKey(new Date(), timeZone);
+  const lastScrapeKey = localDateKey(store.lastScrapeAt, timeZone);
+  if (!todayKey || !lastScrapeKey || todayKey !== lastScrapeKey) return null;
+  if (!(store.companyScanJobs || []).length) return null;
+  const runs = store.scanRuns || [];
+  return runs.find((scanRun) => {
+    const finishedAt = scanRun.finishedAt || scanRun.startedAt;
+    return finishedAt &&
+      localDateKey(finishedAt, timeZone) === todayKey &&
+      isFullScanScope(scanRun.scope) &&
+      scanRun.status !== "failed";
+  }) || null;
+}
+
+function createCachedEmailDigestScanRun(store, settings, sourceScanRun = null) {
+  const companies = (store.targetCompanies || []).filter((item) => item.careersUrl);
+  const scanRun = createScanRun("Email digest", companies);
+  scanRun.status = "completed";
+  scanRun.finishedAt = new Date().toISOString();
+  scanRun.cachedFromScanRunId = sourceScanRun?.id || "";
+  scanRun.cachedFromScanRunScope = sourceScanRun?.scope || "";
+  scanRun.totals.rawJobsFound = (store.companyScanJobs || []).length;
+  scanRun.totals.jobsFound = (store.companyScanJobs || []).length;
+  scanRun.totals.detailCacheHits = (store.companyScanJobs || []).length;
+  scanRun.totals.llmCacheHits = (store.companyScanJobs || []).length;
+  scanRun.totals.llmCalls = 0;
+  scanRun.totals.llmSucceeded = 0;
+  scanRun.companies = companies.map((company) => {
+    const jobs = (store.companyScanJobs || []).filter((job) => job.companyId === company.id || job.company === company.name);
+    return {
+      id: company.id,
+      name: company.name,
+      careersUrl: company.careersUrl,
+      status: "completed",
+      extractor: "Cached daily scan",
+      startedAt: scanRun.startedAt,
+      finishedAt: scanRun.finishedAt,
+      rawJobsFound: jobs.length,
+      jobsFound: jobs.length,
+      pageFetches: 0,
+      detailFetches: 0,
+      detailCacheHits: jobs.length,
+      metaApiCalls: 0,
+      llmCalls: 0,
+      llmCacheHits: jobs.length,
+      llmSucceeded: 0,
+      llmFailed: 0,
+      errors: [],
+      calls: [{
+        at: scanRun.finishedAt,
+        type: "Email digest cache",
+        target: company.name,
+        status: "ok",
+        count: jobs.length,
+        message: "Used existing daily scan results"
+      }]
+    };
+  });
+  return scanRun;
 }
 
 function digestJobPreview(job) {
@@ -5315,16 +5459,26 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
     return { sent: true, count: 0, test: true };
   }
 
-  const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "email digest", store.resumeText || "", store.jobDetailCache || {}, user.id);
-  recordScanUsage(user.id, result.scanRun);
-  const digestScanJobs = result.companyScanJobs || [];
-  applyScanResultToStore(store, result);
-  addScanRun(store, result.scanRun);
+  let scanRun;
+  let digestScanJobs;
+  const cachedSourceScanRun = freshEmailDigestScanRun(store, settings);
+  if (cachedSourceScanRun) {
+    digestScanJobs = annotateJobs(store.companyScanJobs || [], store.profile, store.jobFeedback || {});
+    scanRun = createCachedEmailDigestScanRun(store, settings, cachedSourceScanRun);
+    recordScanUsage(user.id, scanRun);
+  } else {
+    const result = await scrapeJobs(store.profile, store.targetCompanies, store.jobFeedback || {}, store.companyScanJobs || [], "email digest", store.resumeText || "", store.jobDetailCache || {}, user.id);
+    recordScanUsage(user.id, result.scanRun);
+    digestScanJobs = result.companyScanJobs || [];
+    applyScanResultToStore(store, result);
+    scanRun = result.scanRun;
+  }
 
   const eligibleCandidates = digestEligibleJobs(digestScanJobs, store, sentJobKeys(user.id));
   const candidates = eligibleCandidates.slice(0, emailDigestMaxJobs(settings));
   if (!candidates.length) {
-    result.scanRun.emailDigest = emailDigestScanSummary(result.scanRun, settings, [], eligibleCandidates.length, "no_matches");
+    scanRun.emailDigest = emailDigestScanSummary(scanRun, settings, [], eligibleCandidates.length, "no_matches");
+    addScanRun(store, scanRun);
     store.emailDigest.lastDigestSentAt = new Date().toISOString();
     store.emailDigest.lastDigestStatus = "No new relevant jobs found.";
     writeStore(user.id, store);
@@ -5335,7 +5489,8 @@ async function runEmailDigestForUser(user, { force = false, test = false } = {})
   const message = renderDigestEmail(user, candidates, settings, eligibleCandidates.length);
   await sendEmail({ to: settings.email, ...message });
   recordEmailDigestSends(user.id, digestId, candidates);
-  result.scanRun.emailDigest = emailDigestScanSummary(result.scanRun, settings, candidates, eligibleCandidates.length, "sent", digestId);
+  scanRun.emailDigest = emailDigestScanSummary(scanRun, settings, candidates, eligibleCandidates.length, "sent", digestId);
+  addScanRun(store, scanRun);
   store.emailDigest.lastDigestSentAt = new Date().toISOString();
   store.emailDigest.lastDigestStatus = `Sent ${candidates.length} of ${eligibleCandidates.length} new relevant opening${eligibleCandidates.length === 1 ? "" : "s"} to ${settings.email}.`;
   writeStore(user.id, store);
@@ -5398,6 +5553,21 @@ async function maybeDailyEmailDigests() {
       writeStore(user.id, latest);
       console.error(`Email digest failed for ${user.email}:`, error.message);
     }
+  }
+}
+
+let backgroundJobsRunning = false;
+
+async function runScheduledBackgroundJobs() {
+  if (backgroundJobsRunning) return;
+  backgroundJobsRunning = true;
+  try {
+    await maybeDailyScrape();
+    await maybeDailyEmailDigests();
+  } catch (error) {
+    console.error("Background jobs failed:", error.message);
+  } finally {
+    backgroundJobsRunning = false;
   }
 }
 
@@ -5827,10 +5997,6 @@ server.listen(PORT, HOST, () => {
   }
   const firstRunDelayMs = Math.max(0, Number(process.env.BACKGROUND_JOBS_FIRST_RUN_DELAY_MS || 180000));
   const intervalMs = Math.max(60000, Number(process.env.BACKGROUND_JOBS_INTERVAL_MS || 60 * 60 * 1000));
-  setTimeout(() => {
-    maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message));
-    maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message));
-  }, firstRunDelayMs);
-  setInterval(() => maybeDailyScrape().catch((error) => console.error("Daily scrape failed:", error.message)), intervalMs);
-  setInterval(() => maybeDailyEmailDigests().catch((error) => console.error("Email digest check failed:", error.message)), intervalMs);
+  setTimeout(() => runScheduledBackgroundJobs(), firstRunDelayMs);
+  setInterval(() => runScheduledBackgroundJobs(), intervalMs);
 });

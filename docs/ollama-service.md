@@ -1,6 +1,6 @@
-# Ollama Qwen Fallback
+# Ollama Qwen Primary
 
-AI Job Tracker uses OpenAI first for job summaries and personalized scoring. If OpenAI fails, the local app can fall back to Qwen through Ollama.
+AI Job Tracker uses Qwen through Ollama first for job summaries and personalized scoring. If Ollama is unavailable or fails for a job, the local app falls back to the OpenAI API.
 
 ## Environment
 
@@ -14,7 +14,7 @@ OLLAMA_CONTEXT_LENGTH=4096
 OLLAMA_APP_CONCURRENCY=2
 ```
 
-`OLLAMA_CONTEXT_LENGTH` is also sent to Ollama as `num_ctx` for each fallback request. `OLLAMA_APP_CONCURRENCY` limits how many Qwen fallback calls the dashboard sends at once.
+`OLLAMA_CONTEXT_LENGTH` is also sent to Ollama as `num_ctx` for each request. `OLLAMA_APP_CONCURRENCY` limits how many Qwen calls the dashboard sends at once.
 
 `OLLAMA_NUM_PARALLEL` is different: it must be set in the environment of the Ollama server process itself. The launchd template in `ops/com.ai-job-tracker.ollama.plist` sets it to `2`.
 
@@ -61,5 +61,5 @@ Logs are written to:
 ## Important Notes
 
 - Do not run both Ollama desktop auto-start and this launchd service at the same time.
-- Render cannot call Ollama on your Mac at `127.0.0.1:11434`; this fallback is for local/cloudflared hosting.
-- Scanner logs will show `Ollama fallback` when Qwen is used after OpenAI fails.
+- Render cannot call Ollama on your Mac at `127.0.0.1:11434`; this primary local model path is for local/cloudflared hosting.
+- Scanner logs will show `Ollama summary` when Qwen is used and `OpenAI fallback` only when Ollama fails.

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-job-tracker.dashboard</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/shrey/Documents/Codex/2026-05-16/i-want-to-make-a-dashboard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/shrey/.nvm/versions/node/v22.21.1/bin/node</string>
+    <string>server.js</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>HOST</key>
+    <string>127.0.0.1</string>
+    <key>PORT</key>
+    <string>4173</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/ai-job-tracker-dashboard.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/ai-job-tracker-dashboard.err</string>
+</dict>
+</plist>
