@@ -1480,6 +1480,88 @@ function recordScanCall(scanRun, companyLog, call) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const retryableFetchStatuses = new Set([408, 425, 429, 500, 502, 503, 504, 520, 522, 524]);
+
+function cleanFetchErrorMessage(error) {
+  if (error?.name === "AbortError") return "request timed out";
+  return (cleanText(error?.message || error?.cause?.message || error?.name || error || "fetch failed") || "fetch failed").slice(0, 320);
+}
+
+function isRetryableFetchError(error) {
+  const message = `${error?.name || ""} ${error?.code || ""} ${error?.message || ""} ${error?.cause?.code || ""} ${error?.cause?.message || ""}`;
+  return error?.name === "AbortError" ||
+    /fetch failed|terminated|aborted|timeout|timed out|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR|socket|network/i.test(message);
+}
+
+function retryAfterMs(response, fallbackMs) {
+  const header = response?.headers?.get?.("retry-after");
+  if (!header) return fallbackMs;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(fallbackMs, seconds * 1000);
+  const dateMs = safeDate(header);
+  return dateMs ? Math.max(fallbackMs, dateMs - Date.now()) : fallbackMs;
+}
+
+async function fetchWithRetry(resource, options = {}, config = {}) {
+  const {
+    timeoutMs = 20000,
+    retries = 2,
+    retryDelayMs = 750,
+    label = "fetch",
+    scanRun = null,
+    companyLog = null,
+    retryType = "fetch retry",
+    target = ""
+  } = config;
+  const attempts = Math.max(1, retries + 1);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const signal = options.signal && typeof AbortSignal?.any === "function"
+      ? AbortSignal.any([options.signal, controller.signal])
+      : controller.signal;
+
+    try {
+      const response = await fetch(resource, { ...options, signal });
+      clearTimeout(timeout);
+      if (retryableFetchStatuses.has(response.status) && attempt < attempts) {
+        const preview = cleanText(await response.text().catch(() => "")).slice(0, 180);
+        recordScanCall(scanRun, companyLog, {
+          type: retryType,
+          target,
+          status: "retry",
+          message: `${label} returned ${response.status} ${response.statusText}; retrying ${attempt + 1}/${attempts}${preview ? ` · ${preview}` : ""}`
+        });
+        await sleep(retryAfterMs(response, retryDelayMs * attempt));
+        continue;
+      }
+      return response;
+    } catch (error) {
+      clearTimeout(timeout);
+      lastError = error;
+      if (attempt < attempts && isRetryableFetchError(error)) {
+        recordScanCall(scanRun, companyLog, {
+          type: retryType,
+          target,
+          status: "retry",
+          message: `${label} ${cleanFetchErrorMessage(error)}; retrying ${attempt + 1}/${attempts}`
+        });
+        await sleep(retryDelayMs * attempt);
+        continue;
+      }
+      break;
+    }
+  }
+
+  throw new Error(`${label} ${cleanFetchErrorMessage(lastError)} after ${attempts} attempt${attempts === 1 ? "" : "s"}`);
+}
+
 function finishScanRun(scanRun, status = "completed") {
   if (!scanRun) return null;
   scanRun.status = status;
@@ -3934,11 +4016,20 @@ async function fetchMicrosoftSearchPage(start, num, query = "", scanRun = null, 
   url.searchParams.set("start", String(start));
   url.searchParams.set("num", String(num));
   if (query) url.searchParams.set("query", query);
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     headers: {
       "Accept": "application/json",
       "User-Agent": "CodexJobDashboard/1.0"
     }
+  }, {
+    timeoutMs: 20000,
+    retries: 2,
+    retryDelayMs: 1000,
+    label: "Microsoft search API",
+    scanRun,
+    companyLog,
+    retryType: "Microsoft search retry",
+    target: query ? `${query} · start ${start}` : `start ${start}`
   });
   incrementScanMetric(scanRun, companyLog, "pageFetches");
   const body = await response.text();
@@ -3965,11 +4056,25 @@ async function fetchMicrosoftCareersJobs(company, profile, scanRun = null, compa
   const queries = microsoftSearchQueries(profile);
   const seen = new Set();
   const jobs = [];
+  const errors = [];
 
   for (const query of queries) {
     for (let page = 0; page < maxPages; page += 1) {
       const start = page * pageSize;
-      const positions = await fetchMicrosoftSearchPage(start, pageSize, query, scanRun, companyLog);
+      let positions = [];
+      try {
+        positions = await fetchMicrosoftSearchPage(start, pageSize, query, scanRun, companyLog);
+      } catch (error) {
+        const message = cleanFetchErrorMessage(error);
+        errors.push(`${query || "all jobs"} page ${page + 1}: ${message}`);
+        recordScanCall(scanRun, companyLog, {
+          type: "Microsoft search API",
+          target: query ? `${query} · Microsoft page ${page + 1}` : `Microsoft page ${page + 1}`,
+          status: "error",
+          message
+        });
+        break;
+      }
       if (!positions.length) break;
 
       let recentCount = 0;
@@ -3998,6 +4103,7 @@ async function fetchMicrosoftCareersJobs(company, profile, scanRun = null, compa
     }
   }
 
+  if (!jobs.length && errors.length) throw new Error(errors[0]);
   return jobs;
 }
 
@@ -4166,7 +4272,7 @@ async function fetchWalmartSearchPage(query, page, size, scanRun = null, company
   url.searchParams.set("page", String(page));
   url.searchParams.set("size", String(size));
   url.searchParams.set("locale", "en_US");
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "POST",
     headers: {
       "Accept": "application/json",
@@ -4181,6 +4287,15 @@ async function fetchWalmartSearchPage(query, page, size, scanRun = null, company
       filter: "",
       locale: "en_US"
     })
+  }, {
+    timeoutMs: 20000,
+    retries: 2,
+    retryDelayMs: 1000,
+    label: "Walmart search API",
+    scanRun,
+    companyLog,
+    retryType: "Walmart search retry",
+    target: query ? `${query} · page ${page + 1}` : `page ${page + 1}`
   });
   incrementScanMetric(scanRun, companyLog, "pageFetches");
   const body = await response.text();
@@ -4248,10 +4363,24 @@ async function fetchWalmartCareersJobs(company, profile, landingHtml = "", scanR
   const queries = walmartSearchQueries(profile).slice(0, testMode ? 2 : 8);
   const seen = new Set();
   const jobs = [];
+  const errors = [];
 
   for (const query of queries) {
     for (let page = 0; page < maxPages; page += 1) {
-      const results = await fetchWalmartSearchPage(query, page, pageSize, scanRun, companyLog);
+      let results = [];
+      try {
+        results = await fetchWalmartSearchPage(query, page, pageSize, scanRun, companyLog);
+      } catch (error) {
+        const message = cleanFetchErrorMessage(error);
+        errors.push(`${query || "all jobs"} page ${page + 1}: ${message}`);
+        recordScanCall(scanRun, companyLog, {
+          type: "Walmart search API",
+          target: query ? `${query} · Walmart page ${page + 1}` : `Walmart page ${page + 1}`,
+          status: "error",
+          message
+        });
+        break;
+      }
       if (!results.length) break;
 
       let recentCount = 0;
@@ -4288,6 +4417,7 @@ async function fetchWalmartCareersJobs(company, profile, landingHtml = "", scanR
     }
   }
 
+  if (!jobs.length && errors.length) throw new Error(errors[0]);
   return jobs;
 }
 
@@ -4375,6 +4505,7 @@ async function fetchGoogleCareersJobs(company, profile, landingHtml, scanRun = n
   const queries = googleSearchQueries(profile);
   const seen = new Set();
   const jobs = [];
+  const errors = [];
 
   for (const query of queries) {
     let html = landingHtml;
@@ -4383,21 +4514,45 @@ async function fetchGoogleCareersJobs(company, profile, landingHtml, scanRun = n
       const url = new URL(company.careersUrl);
       url.searchParams.set("q", query);
       target = url.toString();
-      const response = await fetch(target, {
-        headers: {
-          "Accept": "text/html",
-          "User-Agent": "CodexJobDashboard/1.0"
+      try {
+        const response = await fetchWithRetry(target, {
+          headers: {
+            "Accept": "text/html",
+            "User-Agent": "CodexJobDashboard/1.0"
+          }
+        }, {
+          timeoutMs: 20000,
+          retries: 2,
+          retryDelayMs: 1000,
+          label: "Google careers search",
+          scanRun,
+          companyLog,
+          retryType: "Google careers retry",
+          target: query
+        });
+        incrementScanMetric(scanRun, companyLog, "pageFetches");
+        recordScanCall(scanRun, companyLog, {
+          type: "Google careers search",
+          target: query,
+          status: response.ok ? "ok" : "error",
+          message: response.ok ? "Fetched Google careers search page" : `${response.status} ${response.statusText}`
+        });
+        if (!response.ok) {
+          errors.push(`${query}: ${response.status} ${response.statusText}`);
+          continue;
         }
-      });
-      incrementScanMetric(scanRun, companyLog, "pageFetches");
-      recordScanCall(scanRun, companyLog, {
-        type: "Google careers search",
-        target: query,
-        status: response.ok ? "ok" : "error",
-        message: response.ok ? "Fetched Google careers search page" : `${response.status} ${response.statusText}`
-      });
-      if (!response.ok) continue;
-      html = await response.text();
+        html = await response.text();
+      } catch (error) {
+        const message = cleanFetchErrorMessage(error);
+        errors.push(`${query}: ${message}`);
+        recordScanCall(scanRun, companyLog, {
+          type: "Google careers search",
+          target: query,
+          status: "error",
+          message
+        });
+        continue;
+      }
     }
 
     const extracted = extractGoogleCareersJobs(html, company, profile);
@@ -4417,6 +4572,7 @@ async function fetchGoogleCareersJobs(company, profile, landingHtml, scanRun = n
     });
   }
 
+  if (!jobs.length && errors.length) throw new Error(errors[0]);
   return jobs;
 }
 
@@ -4615,7 +4771,7 @@ async function fetchMetaCareersResults(searchInput, lsdToken, referer, scanRun =
   body.set("server_timestamps", "true");
   if (lsdToken) body.set("lsd", lsdToken);
 
-  const response = await fetch("https://www.metacareers.com/api/graphql/", {
+  const response = await fetchWithRetry("https://www.metacareers.com/api/graphql/", {
     method: "POST",
     headers: {
       "Accept": "application/json",
@@ -4625,6 +4781,15 @@ async function fetchMetaCareersResults(searchInput, lsdToken, referer, scanRun =
       ...(lsdToken ? { "x-fb-lsd": lsdToken } : {})
     },
     body
+  }, {
+    timeoutMs: 30000,
+    retries: 2,
+    retryDelayMs: 1500,
+    label: "Meta job search API",
+    scanRun,
+    companyLog,
+    retryType: "Meta job search retry",
+    target: searchInput.q || "all jobs"
   });
 
   incrementScanMetric(scanRun, companyLog, "metaApiCalls");
@@ -4665,24 +4830,38 @@ async function fetchMetaCareersJobs(company, profile, landingHtml, scanRun = nul
   const queries = metaSearchQueries(profile);
   const seen = new Set();
   const jobs = [];
+  const errors = [];
 
   for (const query of queries) {
-    const results = await fetchMetaCareersResults({
-      q: query || null,
-      divisions: [],
-      offices: [],
-      roles: [],
-      leadership_levels: [],
-      saved_jobs: [],
-      saved_searches: [],
-      sub_teams: [],
-      teams: [],
-      is_leadership: false,
-      is_remote_only: false,
-      sort_by_new: true,
-      page: 1,
-      results_per_page: null
-    }, lsdToken, company.careersUrl, scanRun, companyLog);
+    let results = [];
+    try {
+      results = await fetchMetaCareersResults({
+        q: query || null,
+        divisions: [],
+        offices: [],
+        roles: [],
+        leadership_levels: [],
+        saved_jobs: [],
+        saved_searches: [],
+        sub_teams: [],
+        teams: [],
+        is_leadership: false,
+        is_remote_only: false,
+        sort_by_new: true,
+        page: 1,
+        results_per_page: null
+      }, lsdToken, company.careersUrl, scanRun, companyLog);
+    } catch (error) {
+      const message = cleanFetchErrorMessage(error);
+      errors.push(`${query || "all jobs"}: ${message}`);
+      recordScanCall(scanRun, companyLog, {
+        type: "Meta job search API",
+        target: query || company.name,
+        status: "error",
+        message
+      });
+      continue;
+    }
 
     let recentCount = 0;
     for (const result of results) {
@@ -4719,6 +4898,7 @@ async function fetchMetaCareersJobs(company, profile, landingHtml, scanRun = nul
     });
   }
 
+  if (!jobs.length && errors.length) throw new Error(errors[0]);
   return jobs;
 }
 
@@ -4730,8 +4910,6 @@ async function fetchTargetCompanyJobs(profile, targetCompanies, jobFeedback = {}
   for (const company of targetCompanies.filter((item) => item.careersUrl)) {
     const companyLog = companyScanLog(scanRun, company);
     const checkedAt = new Date().toISOString();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
     if (companyLog) {
       companyLog.status = "scanning";
       companyLog.startedAt = checkedAt;
@@ -4750,9 +4928,17 @@ async function fetchTargetCompanyJobs(profile, targetCompanies, jobFeedback = {}
                   : isEightfoldCareersCompany(company) ? "Eightfold embedded jobs" : "Generic link parser";
     }
     try {
-      const response = await fetch(company.careersUrl, {
-        signal: controller.signal,
+      const response = await fetchWithRetry(company.careersUrl, {
         headers: { "User-Agent": "CodexJobDashboard/1.0" }
+      }, {
+        timeoutMs: 20000,
+        retries: 1,
+        retryDelayMs: 1000,
+        label: "company careers page",
+        scanRun,
+        companyLog,
+        retryType: "company careers page retry",
+        target: company.name
       });
       incrementScanMetric(scanRun, companyLog, "pageFetches");
       recordScanCall(scanRun, companyLog, {
@@ -4812,8 +4998,9 @@ async function fetchTargetCompanyJobs(profile, targetCompanies, jobFeedback = {}
       const found = enrich
         ? await enrichJobSummaries(extractedJobs, profile, jobFeedback, historicalJobs, resumeText, scanRun, companyLog, jobDetailCache)
         : extractedJobs;
+      const companyIssues = [...new Set(companyLog?.errors || [])];
       if (companyLog) {
-        companyLog.status = "completed";
+        companyLog.status = companyIssues.length ? "completed_with_issues" : "completed";
         companyLog.finishedAt = new Date().toISOString();
       }
       incrementScanMetric(scanRun, companyLog, "jobsFound", found.length);
@@ -4824,7 +5011,8 @@ async function fetchTargetCompanyJobs(profile, targetCompanies, jobFeedback = {}
         careersUrl: company.careersUrl,
         checkedAt,
         found: found.length,
-        error: null
+        partial: Boolean(found.length && companyIssues.length),
+        error: companyIssues.length ? companyIssues.slice(0, 3).join("; ") : null
       });
     } catch (error) {
       if (companyLog) {
@@ -4845,8 +5033,6 @@ async function fetchTargetCompanyJobs(profile, targetCompanies, jobFeedback = {}
         found: 0,
         error: error.message
       });
-    } finally {
-      clearTimeout(timeout);
     }
   }
 
@@ -4894,10 +5080,11 @@ function updateCompaniesFromScan(targetCompanies, scanResults) {
   return targetCompanies.map((company) => {
     const scan = scanResults.find((item) => item.id === company.id);
     if (!scan) return company;
+    const hardFailure = scan.error && !scan.partial;
     return {
       ...company,
       lastCheckedAt: scan.checkedAt,
-      lastFoundCount: scan.error ? (company.lastFoundCount ?? 0) : scan.found,
+      lastFoundCount: hardFailure ? (company.lastFoundCount ?? 0) : scan.found,
       lastError: scan.error
     };
   });
@@ -4907,7 +5094,7 @@ function successfulScanKeys(scanResults = []) {
   const ids = new Set();
   const names = new Set();
   for (const scan of scanResults) {
-    if (!scan || scan.error) continue;
+    if (!scan || (scan.error && !scan.partial)) continue;
     if (scan.id) ids.add(scan.id);
     if (scan.name) names.add(scan.name);
   }
