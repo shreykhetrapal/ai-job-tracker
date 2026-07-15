@@ -1506,11 +1506,20 @@ function retryAfterMs(response, fallbackMs) {
   return dateMs ? Math.max(fallbackMs, dateMs - Date.now()) : fallbackMs;
 }
 
+function retryDelayForAttempt(retryDelayMs, attempt, jitterMs = 0) {
+  const baseDelay = Array.isArray(retryDelayMs)
+    ? retryDelayMs[Math.min(attempt - 1, retryDelayMs.length - 1)]
+    : retryDelayMs * attempt;
+  const jitter = jitterMs > 0 ? Math.floor(Math.random() * jitterMs) : 0;
+  return Math.max(0, Number(baseDelay || 0) + jitter);
+}
+
 async function fetchWithRetry(resource, options = {}, config = {}) {
   const {
     timeoutMs = 20000,
     retries = 2,
     retryDelayMs = 750,
+    retryJitterMs = 0,
     label = "fetch",
     scanRun = null,
     companyLog = null,
@@ -1532,13 +1541,15 @@ async function fetchWithRetry(resource, options = {}, config = {}) {
       clearTimeout(timeout);
       if (retryableFetchStatuses.has(response.status) && attempt < attempts) {
         const preview = cleanText(await response.text().catch(() => "")).slice(0, 180);
+        const fallbackDelayMs = retryDelayForAttempt(retryDelayMs, attempt, retryJitterMs);
+        const waitMs = retryAfterMs(response, fallbackDelayMs);
         recordScanCall(scanRun, companyLog, {
           type: retryType,
           target,
           status: "retry",
-          message: `${label} returned ${response.status} ${response.statusText}; retrying ${attempt + 1}/${attempts}${preview ? ` · ${preview}` : ""}`
+          message: `${label} returned ${response.status} ${response.statusText}; retrying ${attempt + 1}/${attempts} after ${Math.round(waitMs / 1000)}s${preview ? ` · ${preview}` : ""}`
         });
-        await sleep(retryAfterMs(response, retryDelayMs * attempt));
+        await sleep(waitMs);
         continue;
       }
       return response;
@@ -1546,13 +1557,14 @@ async function fetchWithRetry(resource, options = {}, config = {}) {
       clearTimeout(timeout);
       lastError = error;
       if (attempt < attempts && isRetryableFetchError(error)) {
+        const waitMs = retryDelayForAttempt(retryDelayMs, attempt, retryJitterMs);
         recordScanCall(scanRun, companyLog, {
           type: retryType,
           target,
           status: "retry",
-          message: `${label} ${cleanFetchErrorMessage(error)}; retrying ${attempt + 1}/${attempts}`
+          message: `${label} ${cleanFetchErrorMessage(error)}; retrying ${attempt + 1}/${attempts} after ${Math.round(waitMs / 1000)}s`
         });
-        await sleep(retryDelayMs * attempt);
+        await sleep(waitMs);
         continue;
       }
       break;
@@ -4000,13 +4012,33 @@ function microsoftPositionToJob(position, company) {
   };
 }
 
+const MICROSOFT_SEARCH_PAGE_SIZE = 10;
+const MICROSOFT_MAX_SEARCH_PAGES = 25;
+const MICROSOFT_MAX_SEARCH_QUERIES = 4;
+const MICROSOFT_PAGE_DELAY_MS = 1200;
+const MICROSOFT_PAGE_JITTER_MS = 900;
+const MICROSOFT_RATE_LIMIT_COOLDOWN_MS = 30000;
+const MICROSOFT_RATE_LIMIT_COOLDOWN_JITTER_MS = 15000;
+const MICROSOFT_SEARCH_BACKOFF_MS = [2000, 6000, 15000, 35000];
+
+function microsoftDelayMs(baseMs, jitterMs = 0) {
+  return baseMs + (jitterMs > 0 ? Math.floor(Math.random() * jitterMs) : 0);
+}
+
+function isMicrosoftRateLimitError(error) {
+  return /429|too many requests|try again later|rate limit/i.test(cleanFetchErrorMessage(error));
+}
+
 function microsoftSearchQueries(profile) {
   const desired = normalizeList(profile?.desiredTitles).map(cleanProfileTerm).filter(Boolean);
-  const skills = normalizeList(profile?.skills).map(cleanProfileTerm).filter(Boolean);
-  const queries = [...desired, ...skills]
+  const skills = normalizeList(profile?.skills)
+    .map(cleanProfileTerm)
+    .filter((term) => /\b(analyst|analytics|engineer|scientist|manager|finance|financial|product|data)\b/i.test(term));
+  const sourceTerms = desired.length ? desired : skills;
+  const queries = sourceTerms
     .filter((term) => term.length > 2)
     .filter((term, index, list) => list.findIndex((item) => item.toLowerCase() === term.toLowerCase()) === index)
-    .slice(0, 8);
+    .slice(0, MICROSOFT_MAX_SEARCH_QUERIES);
   return queries.length ? queries : [""];
 }
 
@@ -4023,8 +4055,9 @@ async function fetchMicrosoftSearchPage(start, num, query = "", scanRun = null, 
     }
   }, {
     timeoutMs: 20000,
-    retries: 2,
-    retryDelayMs: 1000,
+    retries: 3,
+    retryDelayMs: MICROSOFT_SEARCH_BACKOFF_MS,
+    retryJitterMs: 1200,
     label: "Microsoft search API",
     scanRun,
     companyLog,
@@ -4039,7 +4072,10 @@ async function fetchMicrosoftSearchPage(start, num, query = "", scanRun = null, 
     status: response.ok ? "ok" : "error",
     message: response.ok ? "Fetched Microsoft jobs page" : `${response.status} ${response.statusText}`
   });
-  if (!response.ok) throw new Error(body || `${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    const preview = cleanText(body).slice(0, 240);
+    throw new Error(`${response.status} ${response.statusText}${preview ? ` - ${preview}` : ""}`);
+  }
   let data;
   try {
     data = JSON.parse(body);
@@ -4051,19 +4087,25 @@ async function fetchMicrosoftSearchPage(start, num, query = "", scanRun = null, 
 }
 
 async function fetchMicrosoftCareersJobs(company, profile, scanRun = null, companyLog = null) {
-  const pageSize = 10;
-  const maxPages = 40;
   const queries = microsoftSearchQueries(profile);
   const seen = new Set();
   const jobs = [];
   const errors = [];
 
+  recordScanCall(scanRun, companyLog, {
+    type: "Microsoft search plan",
+    target: company.name,
+    status: "ok",
+    count: queries.length,
+    message: `Searching ${queries.join(", ") || "all jobs"} with paced pagination`
+  });
+
   for (const query of queries) {
-    for (let page = 0; page < maxPages; page += 1) {
-      const start = page * pageSize;
+    for (let page = 0; page < MICROSOFT_MAX_SEARCH_PAGES; page += 1) {
+      const start = page * MICROSOFT_SEARCH_PAGE_SIZE;
       let positions = [];
       try {
-        positions = await fetchMicrosoftSearchPage(start, pageSize, query, scanRun, companyLog);
+        positions = await fetchMicrosoftSearchPage(start, MICROSOFT_SEARCH_PAGE_SIZE, query, scanRun, companyLog);
       } catch (error) {
         const message = cleanFetchErrorMessage(error);
         errors.push(`${query || "all jobs"} page ${page + 1}: ${message}`);
@@ -4073,6 +4115,16 @@ async function fetchMicrosoftCareersJobs(company, profile, scanRun = null, compa
           status: "error",
           message
         });
+        if (isMicrosoftRateLimitError(error)) {
+          const cooldownMs = microsoftDelayMs(MICROSOFT_RATE_LIMIT_COOLDOWN_MS, MICROSOFT_RATE_LIMIT_COOLDOWN_JITTER_MS);
+          recordScanCall(scanRun, companyLog, {
+            type: "Microsoft rate limit cooldown",
+            target: query || "all jobs",
+            status: "retry",
+            message: `Paused ${Math.round(cooldownMs / 1000)}s before continuing Microsoft search`
+          });
+          await sleep(cooldownMs);
+        }
         break;
       }
       if (!positions.length) break;
@@ -4100,6 +4152,7 @@ async function fetchMicrosoftCareersJobs(company, profile, scanRun = null, compa
         message: postedDateFilterMessage()
       });
       if (olderCount === positions.length) break;
+      await sleep(microsoftDelayMs(MICROSOFT_PAGE_DELAY_MS, MICROSOFT_PAGE_JITTER_MS));
     }
   }
 
